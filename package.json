@@ -1,0 +1,63 @@
+{
+  "name": "dsh-drag-graft",
+  "version": "2.0.0",
+  "description": "Drag a conversation row from the DSH sidebar onto the chat area to insert it into the composer draft as a native session-reference chip, then keep typing before you send.",
+  "type": "module",
+  "license": "MIT",
+  "author": "yoyococo1234 <yoyococo1234@users.noreply.github.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yoyococo1234/dsh-drag-graft.git"
+  },
+  "homepage": "https://github.com/yoyococo1234/dsh-drag-graft#readme",
+  "bugs": {
+    "url": "https://github.com/yoyococo1234/dsh-drag-graft/issues"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "session-reference",
+    "drag-and-drop",
+    "composer"
+  ],
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "README_EN.md",
+    "CHANGELOG.md",
+    "test/*.test.mjs"
+  ],
+  "scripts": {
+    "test": "node --test \"test/*.test.mjs\"",
+    "check": "node --check index.js && node --check client.js && node --test \"test/*.test.mjs\""
+  },
+  "engines": {
+    "dsh": ">=0.2.1-rc.2 <0.3.0-0",
+    "node": ">=22"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-ui-slots"
+      ]
+    }
+  }
+}
