@@ -1,6 +1,6 @@
 {
   "name": "dsh-drag-graft",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Drag a conversation row from the DSH sidebar onto the chat area to insert it into the composer draft as a native session-reference chip, then keep typing before you send.",
   "type": "module",
   "license": "MIT",

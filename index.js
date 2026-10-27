@@ -1,21 +1,23 @@
 /**
  * @local/drag-graft — Host half（只读）
  *
- * 职责只有一件：把「任意一个会话」（包括浏览器里还没打开的那个）的日志
- * 渲染成一段可嫁接的 transcript 文本，通过 RPC 交给 Browser half。
+ * 职责两件：
+ *   1) 把「任意一个会话」的日志渲染成一段可嫁接的 transcript 文本（旧通道，只读）；
+ *   2) 告诉浏览器半区：宿主这条消息最多收几个会话引用（MAX_REFERENCES）。
  *
  * 本半区**不写任何东西**：不建会话、不改文件、不发消息。
  * 建会话 / 投消息都由 Browser half 走官方 sessions 服务完成。
  *
  * RPC channel: /drag-graft
- *   draggraft.ping        {}                       -> { ok, version }
+ *   draggraft.ping        {}                       -> { ok, version, sessionController, limits }
+ *   draggraft.limits      {}                       -> { ok, maxReferences, candidateLimit, patched, source }
  *   draggraft.transcript  { source, maxChars?, maxBlockChars? }
  *     -> { sessionId, title, cwd, transcript, events, turns, range, truncated }
  */
 
 export const name = 'dsh-drag-graft'
 export const CHANNEL = '/drag-graft'
-export const PLUGIN_VERSION = '2.0.0'
+export const PLUGIN_VERSION = '2.1.0'
 
 /** 只需要官方 Session 控制器；不注入未文档化的服务名。 */
 export const inject = ['sessionController']
@@ -127,10 +129,17 @@ const buildTranscript = async (sessionController, sessionId, { maxChars, maxBloc
 }
 
 // ── dispatch ────────────────────────────────────────────────────────────────
-const makeDispatch = (ctx, logger) => async (endpoint, payload = {}) => {
+const makeDispatch = (ctx, logger, readLimits) => async (endpoint, payload = {}) => {
   try {
     if (endpoint === 'draggraft.ping') {
-      return ok({ version: PLUGIN_VERSION, sessionController: typeof ctx.sessionController?.inspect === 'function' })
+      return ok({
+        version: PLUGIN_VERSION,
+        sessionController: typeof ctx.sessionController?.inspect === 'function',
+        limits: readLimits(),
+      })
+    }
+    if (endpoint === 'draggraft.limits') {
+      return ok(readLimits())
     }
     if (endpoint === 'draggraft.transcript') {
       const source = String(payload?.source ?? '').trim()
@@ -168,7 +177,36 @@ export function apply(ctx) {
 
 function applyInner(ctx) {
   const logger = ctx.logger ?? console
-  const dispatch = makeDispatch(ctx, logger)
+
+  // 宿主对「一条消息最多几个会话引用」的硬限制就藏在 sessionReferenceResolver 的
+  // config 里（原版 MAX_REFERENCES = 3）。浏览器半区靠它决定什么时候拦用户。
+  // 该服务是可选的：拿不到就按原版 3 处理，绝不因为缺它而让插件不激活。
+  let resolverRef = null
+  const readLimits = () => {
+    let config = resolverRef?.config ?? null
+    if (!config) {
+      try { config = ctx.get?.('sessionReferenceResolver')?.config ?? null } catch { config = null }
+    }
+    const max = Number(config?.maxReferences)
+    const candidate = Number(config?.candidateLimit)
+    const maxReferences = Number.isFinite(max) && max > 0 ? max : 3
+    return {
+      maxReferences,
+      candidateLimit: Number.isFinite(candidate) && candidate > 0 ? candidate : 50,
+      patched: maxReferences > 3,
+      source: config ? 'sessionReferenceResolver' : 'default',
+    }
+  }
+  try {
+    ctx.inject?.(['sessionReferenceResolver'], (scoped) => {
+      resolverRef = scoped.sessionReferenceResolver
+      return () => { resolverRef = null }
+    })
+  } catch (error) {
+    logger?.warn?.(`[drag-graft] sessionReferenceResolver 注入失败，按默认上限 3 处理：${error?.message ?? error}`)
+  }
+
+  const dispatch = makeDispatch(ctx, logger, readLimits)
 
   const mount = (owner) => {
     const connection = owner?.connection

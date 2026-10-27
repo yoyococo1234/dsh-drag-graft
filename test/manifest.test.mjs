@@ -92,3 +92,26 @@ test('locale metadata carries a title and description', () => {
     assert.ok(dict.meta?.description?.length > 20, `${file} needs meta.description`)
   }
 })
+
+test('版本号在 package.json / host / client 三处一致', () => {
+  const host = read('index.js')
+  const client = read('client.js')
+  const hostVersion = /export const PLUGIN_VERSION = '([^']+)'/.exec(host)?.[1]
+  assert.equal(hostVersion, pkg.version, 'index.js PLUGIN_VERSION 必须等于 package.json version')
+  assert.ok(client.includes(`version: '${pkg.version}'`), 'client.js 调试钩子的 version 必须等于 package.json version')
+})
+
+test('client 向宿主询问引用上限（上限跟着宿主走，不写死）', () => {
+  const client = read('client.js')
+  assert.match(client, /draggraft\.limits/, 'client 必须调用 draggraft.limits')
+  assert.match(client, /captureInsertion/, '插入位点必须用宿主给的 captureInsertion')
+  assert.match(client, /DEFAULT_MAX_REFERENCES = 3/, '拿不到宿主上限时要退回原版保守值 3')
+  assert.ok(!/const MAX_REFERENCES = \d+/.test(client), 'client 里不得再写死引用上限')
+})
+
+test('host 暴露 draggraft.limits 并读取 sessionReferenceResolver 配置', () => {
+  const host = read('index.js')
+  assert.match(host, /draggraft\.limits/)
+  assert.match(host, /sessionReferenceResolver/)
+  assert.match(host, /maxReferences/)
+})

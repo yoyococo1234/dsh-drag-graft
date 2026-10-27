@@ -1,17 +1,21 @@
-// @local/drag-graft — Browser half (v0.5)
+// @local/drag-graft — Browser half (v2.1.0)
 //
-// 零 UI 版：把侧边栏的会话行拖到对话区松手 → 直接投一条**原生会话引用**消息。
+// 把侧边栏的会话行拖到对话区松手 → 在输入框里插一枚**原生会话引用 chip**，
+// 你可以继续打字，然后自己按发送。
 //
-// 为什么这么做：DSH 自带 session-reference 机制——消息文本里写
+// 原理：DSH 自带 session-reference 机制——草稿里的引用节点在提交时变成
 //     @[标题](dsh-session:<base64url(JSON.stringify(sessionId))>)
-// 宿主会解析成结构化引用，UI 渲染成一个蓝标 chip，并把对方会话**压缩成有界预览**
-// （默认 64KB，超长部分落盘留档）注入模型上下文。所以这里不需要倒原文、不需要
-// 自绘任何界面，也没有任何特效：不注册常驻条、不弹面板、不显示按钮。
+// 宿主解析成结构化引用，UI 渲染成蓝标 chip，并把对方会话**压缩成有界预览**
+// （默认每个 64KB，超长部分落盘留档）注入模型上下文。
+// 所以本插件不搬原文、不自绘界面、不注册常驻条、不显示按钮。
 //
-// 唯一保留的挂载点是一个 **渲染 null 的探针**（conversation.input.overlay），
-// 只为拿到「当前会话 id」这个 prop；它在页面上不可见。
+// 唯一挂载点是一个**渲染不可见 span 的探针**（conversation.input.overlay），
+// 只用它拿宿主通过插槽标准 prop 传来的东西：
+//   sessionId     当前会话 id（自引用防护要用）
+//   inputActions  captureInsertion() → detect 坐标 + 当前 draftRev（插入 chip 的 CAS 依据）
+//   useInput      InputState.occurrences（草稿里已有几个引用）
 //
-// 失败才提示（右下角一行字），成功静默——聊天里出现的蓝标就是反馈。
+// 失败才提示（底部一行字），成功静默——草稿里多出来的 chip 就是反馈。
 
 window.__ModuleLoader__.load({
   id: 'dsh-drag-graft',
@@ -22,12 +26,18 @@ window.__ModuleLoader__.load({
     const React = require('react')
     const h = React.createElement
 
+    /** 与宿主半区一致的 RPC 通道（用来读宿主的引用上限）。 */
+    const CHANNEL = '/drag-graft'
     const SESSION_ID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i
     const ID_PREFIX_RE = /^(?:session|sid|session-id)\s*[:#]\s*/i
     const POLL_INTERVAL = 100
     const POLL_TIMEOUT = 5000
+    /** 宿主原版上限。真实值在运行时从宿主半区读，读不到就按这个保守值。 */
+    const DEFAULT_MAX_REFERENCES = 3
+    const PROBE_ID = 'drag-graft-probe'
 
-    const inject = ['slots', 'sessions']
+    // connection 用来问宿主「你这条消息最多收几个引用」，读不到就按 3 处理。
+    const inject = ['slots', 'sessions', 'connection']
 
     // ── 会话引用编码（与 @deepseek-ai/dsh-session-reference 完全一致）──────────
     const encodeSessionUri = (sessionId) => {
@@ -116,6 +126,14 @@ window.__ModuleLoader__.load({
       return false
     }
 
+    /** 草稿里的一条 occurrence 是不是「会话引用」（文件/目录引用不占宿主配额）。 */
+    const isSessionOccurrence = (item) => {
+      if (!item || typeof item !== 'object') return true
+      const appearance = item.appearance ?? item.kind
+      if (typeof appearance === 'string') return appearance === 'session'
+      return String(item.ref ?? '').startsWith('dsh-session:')
+    }
+
     // ── apply ────────────────────────────────────────────────────────────────
     let applied = false
 
@@ -141,21 +159,14 @@ window.__ModuleLoader__.load({
       let composerAnchor = null // 输入卡片内的隐藏锚点，用来定位输入框
       let dragSource = null // { id, title }
       let dragElement = null
-      let busy = false
-      let inputTriggers = null // 官方 @ 触发服务（用 ctx.inject 拿到作用域内的实例）
-      let lastTrack = null // 输入机最近一次 track(draft, caret, guard, draftRev)
+      let inserting = false // 正在插 chip（防连拖叠加）
+      let sending = false // 正在直发兜底
+      let inputTriggers = null // 官方 @ 触发服务
+      let inputActionsRef = null // 官方插入位点服务（captureInsertion）
+      let occurrencesRef = null // InputState.occurrences：草稿里已有的引用
+      let hostLimits = { maxReferences: DEFAULT_MAX_REFERENCES, candidateLimit: null, source: 'default' }
 
-      // 关键：服务必须通过 ctx.inject 取，直接 ctx.get 拿不到（作用域未声明）。
-      try {
-        ctx.inject(['inputTriggers'], (scope) => {
-          inputTriggers = scope.inputTriggers
-          console.info('[drag-graft] inputTriggers ready')
-          return () => { inputTriggers = null }
-        })
-      } catch (error) {
-        console.warn('[drag-graft] inputTriggers 注入失败：', error)
-      }
-
+      // ── 提示 ──────────────────────────────────────────────────────────────
       const toast = (text, isError) => {
         try {
           const el = document.createElement('div')
@@ -178,25 +189,116 @@ window.__ModuleLoader__.load({
         } catch (error) { console.warn('[drag-graft] toast failed:', error) }
       }
 
-      const poll = async (probe, describe) => {
-        const deadline = Date.now() + POLL_TIMEOUT
-        for (;;) {
-          const value = probe()
-          if (value !== undefined && value !== null) return value
-          if (Date.now() > deadline) throw new Error(`等待${describe}超时`)
-          await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL))
+      // ── 宿主上限：跟着宿主走，不再写死 ────────────────────────────────────
+      // 宿主 @deepseek-ai/dsh-session-reference 有 MAX_REFERENCES（原版 3），
+      // 超了在提交时整轮拒绝：a message may reference at most N sessions。
+      // 这里向宿主半区要真实值；宿主被改过（比如提到 100）就跟着放宽。
+      const maxReferences = () => {
+        const value = Number(hostLimits?.maxReferences)
+        return Number.isFinite(value) && value > 0 ? value : DEFAULT_MAX_REFERENCES
+      }
+      const referenceCount = () => {
+        try {
+          const list = Array.isArray(occurrencesRef) ? occurrencesRef : []
+          return list.filter(isSessionOccurrence).length
+        } catch { return 0 }
+      }
+      const warnTooMany = () => {
+        toast(`一条消息最多 ${maxReferences()} 个会话引用（宿主上限）。再多的请分条发，或用 graft_forward 把内容当正文带进来。`, true)
+      }
+      const refreshLimits = async () => {
+        try {
+          const rpc = ctx.connection?.rpc
+          if (typeof rpc?.call !== 'function') {
+            console.warn('[drag-graft] connection.rpc 不可用，按默认上限', DEFAULT_MAX_REFERENCES, '处理')
+            return hostLimits
+          }
+          const res = await rpc.call(CHANNEL, 'draggraft.limits', {})
+          const value = res?.ok ? res.value : null
+          const max = Number(value?.maxReferences)
+          if (Number.isFinite(max) && max > 0) {
+            hostLimits = { ...value, source: 'host' }
+            console.info('[drag-graft] host reference limit =', max, value?.patched ? '(patched host)' : '')
+          } else {
+            console.warn('[drag-graft] 宿主没返回 maxReferences，按默认', DEFAULT_MAX_REFERENCES, '处理', res?.error ?? '')
+          }
+        } catch (error) {
+          console.warn('[drag-graft] 读取宿主引用上限失败，按默认', DEFAULT_MAX_REFERENCES, '处理：', error?.message ?? error)
         }
+        return hostLimits
       }
 
-      const resolveDropId = (event) => {
-        const byId = sessionStore().byId ?? {}
-        const fromTransfer = idFromTransfer(event?.dataTransfer)
-        if (fromTransfer) return fromTransfer
-        if (dragElement?.isConnected) return idFromElement(dragElement, byId)
+      // ── 自引用防护 ────────────────────────────────────────────────────────
+      // 宿主对「消息引用了自己这个会话」是硬拒绝：session "…" cannot reference itself。
+      /** 这条候选是不是当前会话自己（item 里带 session id 时才算得出）。 */
+      const itemRefersToSelf = (item) => {
+        if (!currentSessionId) return false
+        try { return JSON.stringify(item ?? {}).includes(currentSessionId) } catch { return false }
+      }
+
+      /**
+       * 在候选里按标题挑一条：先精确匹配，再允许唯一的前缀/包含匹配。
+       * 自引用候选一律跳过；匹配不到或有歧义就返回 -1（**绝不盲选第一条**——
+       * 第一条往往就是最近/当前会话，盲选会把错的会话塞进草稿）。
+       */
+      const pickIndexFor = (items, title) => {
+        const list = Array.isArray(items) ? items : []
+        const labelOf = (index) => String(list[index]?.label ?? list[index]?.name ?? '').trim().toLowerCase()
+        const usable = []
+        for (let index = 0; index < list.length; index += 1) {
+          if (itemRefersToSelf(list[index])) continue
+          usable.push(index)
+        }
+        if (!usable.length) return -1
+        const wanted = String(title ?? '').trim().toLowerCase()
+        if (!wanted) return usable.length === 1 ? usable[0] : -1
+        const exact = usable.filter((index) => labelOf(index) === wanted)
+        if (exact.length === 1) return exact[0]
+        if (wanted.length >= 4) {
+          const loose = usable.filter((index) => {
+            const label = labelOf(index)
+            return label.length >= 4 && (label.startsWith(wanted) || wanted.startsWith(label))
+          })
+          if (loose.length === 1) return loose[0]
+        }
+        return -1
+      }
+
+      let lastSelfWarnAt = 0
+      const warnSelfReference = () => {
+        const now = Date.now()
+        if (now - lastSelfWarnAt < 1500) return
+        lastSelfWarnAt = now
+        toast('这是当前对话自己，不能引用自己（宿主会拒绝整轮）。请拖别的对话。', true)
+      }
+
+      // ── 官方插入位点 ──────────────────────────────────────────────────────
+      // 必须用宿主给的 inputActions.captureInsertion()：它返回 **detect 坐标**里的
+      // 当前位置 + 当前 draftRev，正是 insertReference 的 CAS 依据
+      // （span.draftRev !== rev 就整条拒绝）。自己用 textContent 长度算坐标、
+      // 再猜 rev，在草稿里已经有 chip 时必然失配——那就是「只能拖一个进去」。
+      const captureSpan = () => {
+        try {
+          const span = inputActionsRef?.captureInsertion?.()
+          if (span && Number.isFinite(span.start) && Number.isFinite(span.end) && Number.isFinite(span.draftRev)) return span
+        } catch (error) { console.warn('[drag-graft] captureInsertion 失败：', error?.message ?? error) }
         return null
       }
 
-      /** 把引用文本插进当前输入框（不发送），保留继续打字/语音的能力。 */
+      // ── 服务注入 ──────────────────────────────────────────────────────────
+      // 关键：服务必须通过 ctx.inject 取，直接 ctx.get 拿不到（作用域未声明）。
+      try {
+        ctx.inject(['inputTriggers'], (scope) => {
+          inputTriggers = scope.inputTriggers
+          console.info('[drag-graft] inputTriggers ready')
+          return () => { inputTriggers = null }
+        })
+      } catch (error) {
+        console.warn('[drag-graft] inputTriggers 注入失败：', error)
+      }
+      void refreshLimits()
+
+      // ── 输入框定位 ────────────────────────────────────────────────────────
       const findComposerEditor = () => {
         if (composerAnchor?.isConnected) {
           let node = composerAnchor
@@ -210,277 +312,48 @@ window.__ModuleLoader__.load({
         return all.length ? all[all.length - 1] : null
       }
 
-      const insertIntoComposer = (text) => {
-        try {
-          const editor = findComposerEditor()
-          if (!editor) return false
-          editor.focus?.()
-          if (editor.tagName === 'TEXTAREA' || editor.tagName === 'INPUT') {
-            const before = editor.value ?? ''
-            const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set
-              ?? Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set
-            setter?.call(editor, `${before}${before && !before.endsWith(' ') ? ' ' : ''}${text}`)
-            editor.dispatchEvent(new Event('input', { bubbles: true }))
-            return (editor.value ?? '').length > before.length
-          }
-          // contenteditable：光标移到末尾后插入
-          try {
-            const selection = window.getSelection()
-            const range = document.createRange()
-            range.selectNodeContents(editor)
-            range.collapse(false)
-            selection?.removeAllRanges()
-            selection?.addRange(range)
-          } catch { /* 选择失败也继续试插入 */ }
-          const before = editor.textContent ?? ''
-          try { document.execCommand('insertText', false, text) } catch { /* 继续走 paste 兜底 */ }
-          if ((editor.textContent ?? '').length > before.length) return true
-          // 合成 paste：Lexical / ProseMirror / CodeMirror 都监听 paste 并读 clipboardData
-          try {
-            const dt = new DataTransfer()
-            dt.setData('text/plain', text)
-            const event = new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData: dt })
-            Object.defineProperty(event, 'clipboardData', { value: dt })
-            editor.dispatchEvent(event)
-          } catch { /* ignore */ }
-          return (editor.textContent ?? '').length > before.length
-        } catch (error) {
-          console.warn('[drag-graft] 插入输入框失败：', error)
-          return false
-        }
+      const resolveDropId = (event) => {
+        const byId = sessionStore().byId ?? {}
+        const fromTransfer = idFromTransfer(event?.dataTransfer)
+        if (fromTransfer) return fromTransfer
+        if (dragElement?.isConnected) return idFromElement(dragElement, byId)
+        return null
       }
 
       /**
-       * 走官方 @ 触发流程把「真 chip」插进输入框：
-       *   1) 在输入框打 `@标题片段` → 官方 inputTriggers 弹出候选
-       *   2) 读 controller.menu 快照，找到目标会话那一行
-       *   3) 调 controller.pick('reference', index) —— 官方自己插入结构化引用节点
-       * 任何一步不成立就撤销刚才打的字并返回 false（调用方退回直接发送）。
+       * 把目标会话插成草稿里的真 chip（不发送）。
+       * 每次尝试都重新 captureInsertion()：rev 随每次编辑递增，猜不得。
        */
-      const insertChipViaTrigger = async (sourceId, title) => {
-        const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
-        const undo = () => {
-          try { document.execCommand('undo'); document.execCommand('undo') } catch { /* ignore */ }
-        }
-        try {
-          const service = inputTriggers ?? (() => { try { return ctx.get('inputTriggers') } catch { return null } })()
-          if (!service?.sessionOf) {
-            console.warn('[drag-graft] inputTriggers 不可用（注入未完成或该版本无此服务）')
-            return false
-          }
-          if (!currentSessionId) {
-            console.warn('[drag-graft] 当前会话 id 未知')
-            return false
-          }
-          // scope 可能在会话刚打开时短暂缺失，重试几次
-          let scope = null
-          for (let attempt = 0; attempt < 12 && !scope; attempt += 1) {
-            scope = sessions.scope?.(currentSessionId) ?? null
-            if (!scope) await sleep(60)
-          }
-          if (!scope) {
-            console.warn('[drag-graft] sessions.scope 取不到，放弃插入')
-            return false
-          }
-          const controller = service.sessionOf(scope)
-          if (!controller?.menu || typeof controller.pick !== 'function') {
-            console.warn('[drag-graft] controller 形状不符', Object.keys(controller ?? {}))
-            return false
-          }
-
-          const editor = findComposerEditor()
-          const query = `@${String(title ?? '').slice(0, 18)}`
-          if (!insertIntoComposer(query)) {
-            console.warn('[drag-graft] 打不出 @ 查询串（编辑器拒绝插入）')
-            return false
-          }
-
-          const deadline = Date.now() + 2500
-          while (Date.now() < deadline) {
-            await sleep(120)
-            let state = null
-            try {
-              const snap = controller.menu.getSnapshot?.()
-              state = snap?.state ?? snap
-            } catch { state = null }
-            if (!state?.open) continue
-            const groups = Array.isArray(state.groups) ? state.groups : []
-            const group = groups.find((g) => g?.source === 'reference' && g?.status !== 'pending' && (g?.items?.length ?? 0) > 0)
-            if (!group) continue
-            const items = group.items
-            const wanted = String(title ?? '').trim().toLowerCase()
-            let index = items.findIndex((item) => String(item?.label ?? item?.name ?? '').trim().toLowerCase() === wanted)
-            if (index < 0 && items.length === 1) index = 0
-            if (index < 0) continue
-            try {
-              controller.pick('reference', index)
-            } catch (error) {
-              console.warn('[drag-graft] controller.pick 失败：', error?.message ?? error)
-              break
-            }
-            await sleep(120)
-            // 校验：chip 落进草稿后，刚才打的 `@查询串` 应当消失
-            const text = (findComposerEditor() ?? editor)?.textContent ?? ''
-            if (query.length > 2 && text.includes(query)) {
-              console.warn('[drag-graft] pick 后草稿仍含查询串，判定插入失败')
-              undo()
-              return false
-            }
-            console.info('[drag-graft] chip inserted via @ trigger', sourceId, 'index', index)
-            return true
-          }
-          undo()
-          return false
-        } catch (error) {
-          console.warn('[drag-graft] 触发式插入失败：', error)
-          undo()
-          return false
-        }
-      }
-
-      /**
-       * 官方 launcher 路径：`controller.toggleSource(source, hit)` + `pick()`。
-       *
-       * 与"打字触发"不同，这里**不往输入框写任何东西**：
-       *   toggleSource 用合成 hit（trigger/query/span）直接打开 reference 源菜单，
-       *   pick 之后走官方事件 `slash/input-insert-reference` 把 chip 插进草稿。
-       *   span 带 draftRev 做 CAS：rev 不匹配时官方直接不插入（不会留垃圾），
-       *   所以可以安全地用"最近一次 track 记录的 rev / 邻近 rev / 不带 rev"依次试探。
-       *
-       * 返回 true 表示草稿确实变了（chip 落进去了）。
-       */
-      const insertChipViaLauncher = async (sourceId, title) => {
-        const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
-        try {
-          const service = inputTriggers ?? (() => { try { return ctx.get('inputTriggers') } catch { return null } })()
-          if (!service?.sessionOf) { console.warn('[drag-graft] inputTriggers 不可用'); return false }
-          if (!currentSessionId) return false
-          let scope = null
-          for (let i = 0; i < 12 && !scope; i += 1) {
-            scope = sessions.scope?.(currentSessionId) ?? null
-            if (!scope) await sleep(60)
-          }
-          if (!scope) { console.warn('[drag-graft] 取不到 sessions.scope'); return false }
-          const controller = service.sessionOf(scope)
-          if (!controller?.toggleSource || typeof controller.pick !== 'function') {
-            console.warn('[drag-graft] controller 缺少 toggleSource/pick')
-            return false
-          }
-
-          // 记录输入机真实 draftRev（track 是它每次草稿变化的入口）
-          if (!controller.__dragGraftPatched) {
-            const original = controller.track?.bind(controller)
-            if (original) {
-              controller.track = (...args) => {
-                try { lastTrack = { draft: args[0], caret: args[1], rev: args[3] } } catch { /* ignore */ }
-                return original(...args)
-              }
-              controller.__dragGraftPatched = true
-            }
-          }
-
-          const editor = findComposerEditor()
-          const before = editor?.textContent ?? ''
-          const caret = before.length
-          const wanted = String(title ?? '').trim().toLowerCase()
-
-          const revs = []
-          if (lastTrack && typeof lastTrack.rev === 'number') {
-            revs.push(lastTrack.rev, lastTrack.rev + 1, lastTrack.rev + 2)
-          }
-          revs.push(undefined) // 不带 rev：若官方不做 CAS 也能直接成功
-
-          for (const rev of revs) {
-            const hit = {
-              trigger: '@',
-              query: '',
-              quoted: false,
-              position: 'leading',
-              span: rev === undefined ? { start: caret, end: caret } : { start: caret, end: caret, draftRev: rev },
-            }
-            try { controller.toggleSource('reference', hit) } catch (error) {
-              console.warn('[drag-graft] toggleSource 失败：', error?.message ?? error)
-              return false
-            }
-
-            // 等候选落地
-            let picked = null
-            const deadline = Date.now() + 2000
-            while (Date.now() < deadline) {
-              await sleep(100)
-              let state = null
-              try { const snap = controller.menu.getSnapshot?.(); state = snap?.state ?? snap } catch { state = null }
-              if (!state?.open) break
-              const group = (state.groups ?? []).find((g) => g?.source === 'reference' && g?.status === 'ready' && (g?.items?.length ?? 0) > 0)
-              if (!group) continue
-              const items = group.items
-              let index = items.findIndex((item) => String(item?.label ?? item?.name ?? '').trim().toLowerCase() === wanted)
-              if (index < 0 && items.length === 1) index = 0
-              if (index < 0) index = 0 // 候选里第一条通常就是最近会话
-              picked = index
-              break
-            }
-            if (picked === null) { try { controller.dismiss() } catch { /* ignore */ } ; continue }
-
-            try { controller.pick('reference', picked) } catch (error) {
-              console.warn('[drag-graft] pick 失败：', error?.message ?? error)
-              try { controller.dismiss() } catch { /* ignore */ }
-              continue
-            }
-            await sleep(160)
-            const after = (findComposerEditor() ?? editor)?.textContent ?? ''
-            if (after !== before) {
-              console.info('[drag-graft] chip inserted via launcher', sourceId, 'rev', rev, 'index', picked)
-              return true
-            }
-            try { controller.dismiss() } catch { /* ignore */ }
-          }
-          console.info('[drag-graft] launcher 路径未插入（CAS 未命中）')
-          return false
-        } catch (error) {
-          console.warn('[drag-graft] launcher 插入失败：', error)
-          return false
-        }
-      }
-
-      /**
-       * 按 draftRev 逐个试探的插入：官方 settle 每次 pick 都会关菜单，所以每轮重新
-       * toggleSource。rev 用"输入机 track 记录的真实 rev"优先，其次 0..8 兜底；
-       * CAS 不匹配时官方不插入，因此重试是安全的（不会留下任何残留）。
-       */
-      const insertChipByRevs = async (sourceId, title) => {
+      const insertChip = async (sourceId, title) => {
         const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
         try {
           if (!inputTriggers?.sessionOf || !currentSessionId) return false
           const scope = sessions.scope?.(currentSessionId)
           if (!scope) return false
           const controller = inputTriggers.sessionOf(scope)
-          if (!controller?.toggleSource || typeof controller.pick !== 'function') return false
-          patchTrack(currentSessionId)
+          if (!controller?.toggleSource || typeof controller.pick !== 'function') {
+            console.warn('[drag-graft] inputTriggers controller 形状不符')
+            return false
+          }
 
           const editor = findComposerEditor()
-          const draftNow = editor?.textContent ?? ''
-          const caret = lastTrack && lastTrack.draft === draftNow && typeof lastTrack.caret === 'number'
-            ? lastTrack.caret
-            : draftNow.length
-          const wanted = String(title ?? '').trim().toLowerCase()
           const query = String(title ?? '').slice(0, 24)
-
-          const revs = []
-          if (lastTrack && typeof lastTrack.rev === 'number') revs.push(lastTrack.rev)
-          for (let r = 0; r <= 8; r += 1) if (!revs.includes(r)) revs.push(r)
-
-          for (const rev of revs) {
-            const hit = {
-              trigger: '@', query, quoted: false, position: 'leading',
-              span: { start: caret, end: caret, draftRev: rev },
+          const attempts = 4
+          for (let attempt = 0; attempt < attempts; attempt += 1) {
+            const span = captureSpan()
+            if (!span) {
+              console.info('[drag-graft] 拿不到官方插入位点（captureInsertion 不可用），放弃插 chip')
+              return false
             }
+            const before = (findComposerEditor() ?? editor)?.textContent ?? ''
+            const hit = { trigger: '@', query, quoted: false, position: 'leading', span }
             try { controller.toggleSource('reference', hit) } catch (error) {
               console.warn('[drag-graft] toggleSource 失败：', error?.message ?? error)
               return false
             }
 
             let index = -1
+            let noMatch = false
             const deadline = Date.now() + 1500
             while (Date.now() < deadline) {
               await sleep(100)
@@ -489,12 +362,13 @@ window.__ModuleLoader__.load({
               if (!state?.open) break
               const group = (state.groups ?? []).find((g) => g?.source === 'reference' && g?.status === 'ready' && (g?.items?.length ?? 0) > 0)
               if (!group) continue
-              const items = group.items
-              let found = items.findIndex((item) => String(item?.label ?? item?.name ?? '').trim().toLowerCase() === wanted)
-              if (found < 0) found = 0
-              index = found
+              const matched = pickIndexFor(group.items, title)
+              // 候选已就绪但没有目标：换一次尝试也不会变出目标，立刻放弃（交给直发兜底）
+              if (matched < 0) { noMatch = true; break }
+              index = matched
               break
             }
+            if (noMatch) { try { controller.dismiss() } catch { /* ignore */ } ; break }
             if (index < 0) { try { controller.dismiss() } catch { /* ignore */ } ; continue }
 
             try { controller.pick('reference', index) } catch (error) {
@@ -502,27 +376,36 @@ window.__ModuleLoader__.load({
             }
             await sleep(130)
             const after = (findComposerEditor() ?? editor)?.textContent ?? ''
-            if (after !== draftNow) {
-              console.info('[drag-graft] chip inserted, rev =', rev, 'index =', index)
+            if (after !== before) {
+              console.info('[drag-graft] chip inserted, draftRev =', span.draftRev, 'index =', index, 'attempt =', attempt)
               return true
             }
+            try { controller.dismiss() } catch { /* ignore */ }
           }
-          console.info('[drag-graft] 所有 rev 试探均未插入')
+          console.info('[drag-graft] 插 chip 未成功（span / CAS 未命中）')
           return false
         } catch (error) {
-          console.warn('[drag-graft] insertChipByRevs 失败：', error)
+          console.warn('[drag-graft] insertChip 失败：', error)
           return false
         }
       }
 
       /** 兜底：直接投一条只含会话引用的消息（宿主解析成蓝标 + 有界预览）。 */
       const dropReference = async (sourceId, label) => {
-        if (busy) return
-        busy = true
+        if (currentSessionId && sourceId === currentSessionId) { warnSelfReference(); return }
         try {
           const targetId = currentSessionId
           if (!targetId) throw new Error('拿不到当前会话 id，请刷新页面后再试')
-          const target = await poll(() => sessions.binding(targetId)?.session ?? null, '当前会话绑定')
+          const target = await new Promise((resolve, reject) => {
+            const deadline = Date.now() + POLL_TIMEOUT
+            const tick = () => {
+              const session = sessions.binding(targetId)?.session ?? null
+              if (session) return resolve(session)
+              if (Date.now() > deadline) return reject(new Error('等待当前会话绑定超时'))
+              setTimeout(tick, POLL_INTERVAL)
+            }
+            tick()
+          })
           const text = formatMention(sourceId, label)
           const result = await target.prompt([{ type: 'text', text }], 'queue')
           if (!result?.ok) throw new Error(`投递被拒绝[${result?.error?.code ?? 'unknown'}]：${result?.error?.message ?? ''}`)
@@ -532,12 +415,10 @@ window.__ModuleLoader__.load({
         } catch (error) {
           toast(`引用对话失败：${error?.message ?? String(error)}`, true)
           console.warn('[drag-graft] reference failed:', error)
-        } finally {
-          busy = false
         }
       }
 
-      // ── 拖拽拦截：只认「非文件 + 落在对话区（非侧栏行）」的投放 ────────────────
+      // ── 拖拽拦截：只认「非文件 + 落在对话区（非侧栏行）」的投放 ────────────
       const onDragStart = (event) => {
         dragElement = null
         dragSource = null
@@ -578,13 +459,29 @@ window.__ModuleLoader__.load({
           toast('没认出被拖的是哪个对话（拖拽数据里没有会话 id）。', true)
           return
         }
+        if (currentSessionId && id === currentSessionId) {
+          warnSelfReference()
+          return
+        }
+        if (referenceCount() >= maxReferences()) {
+          warnTooMany()
+          return
+        }
+        if (inserting || sending) return // 连拖不叠加
         const row = sessionStore().byId?.[id]
         const label = row?.displayTitle ?? row?.title ?? source.title ?? ''
+        inserting = true
         void (async () => {
-          // 首选：把真 chip 插进草稿（可继续打字再发送）。CAS 不匹配时官方不插入，无残留。
-          if (await insertChipByRevs(id, label)) return
-          // 兜底：直接发一条引用消息（对话里出现蓝标），输入框保持干净。
-          void dropReference(id, label)
+          try {
+            // 首选：把真 chip 插进草稿（可继续打字再发送）。CAS 不匹配时官方不插入，无残留。
+            if (await insertChip(id, label)) return
+            // 兜底：直接发一条引用消息（对话里出现蓝标），输入框保持干净。
+            sending = true
+            await dropReference(id, label)
+          } finally {
+            inserting = false
+            sending = false
+          }
         })()
       }
 
@@ -597,41 +494,17 @@ window.__ModuleLoader__.load({
       listen('drop', onDrop, true)
       listen('dragend', () => { dragSource = null; dragElement = null }, true)
 
-      // ── 不可见探针：拿当前会话 id + 提供一个定位输入框的 DOM 锚点（零视觉）──────
-      // 顺便在输入机上挂 track 钩子，记录真实 draftRev（官方插入事件的 CAS 依据）。
-      const patchTrack = (sessionId) => {
-        try {
-          const scope = sessionId ? sessions.scope?.(sessionId) : null
-          const controller = scope && inputTriggers?.sessionOf ? inputTriggers.sessionOf(scope) : null
-          if (!controller || typeof controller.track !== 'function' || controller.__dragGraftPatched) return false
-          const original = controller.track.bind(controller)
-          controller.track = (...args) => {
-            try { lastTrack = { draft: args[0], caret: args[1], rev: args[3] } } catch { /* ignore */ }
-            return original(...args)
-          }
-          controller.__dragGraftPatched = true
-          console.info('[drag-graft] track hook installed')
-          return true
-        } catch (error) {
-          console.warn('[drag-graft] track hook failed:', error)
-          return false
-        }
-      }
-
-      const Probe = ({ sessionId }) => {
+      // ── 不可见探针：接住宿主发来的 sessionId / inputActions / useInput ──────
+      const Probe = (props) => {
+        const { sessionId, inputActions, useInput } = props
+        // InputState.occurrences = 草稿里已有的引用条目；用来在到顶时提前拦下。
+        let occurrences = null
+        try { occurrences = useInput ? useInput((state) => state.occurrences) : null } catch { occurrences = null }
+        if (Array.isArray(occurrences)) occurrencesRef = occurrences
         React.useEffect(() => {
           currentSessionId = sessionId ?? null
-          if (!patchTrack(sessionId)) {
-            // inputTriggers 可能晚一步就绪：短暂重试
-            let tries = 0
-            const timer = setInterval(() => {
-              tries += 1
-              if (patchTrack(sessionId) || tries > 20) clearInterval(timer)
-            }, 250)
-            return () => clearInterval(timer)
-          }
-          return undefined
-        }, [sessionId])
+          if (inputActions) inputActionsRef = inputActions
+        }, [sessionId, inputActions])
         return h('span', {
           ref: (el) => { composerAnchor = el ?? null },
           'aria-hidden': true,
@@ -641,7 +514,7 @@ window.__ModuleLoader__.load({
       const registerProbe = (slotName) => {
         try {
           disposers.push(ctx.slots.inject(slotName, () => ctx.slots.register({
-            name: slotName, id: 'drag-graft-probe', order: 10,
+            name: slotName, id: PROBE_ID, order: 10,
           }, Probe)))
           console.info('[drag-graft] probe mounted on', slotName)
           return true
@@ -664,65 +537,26 @@ window.__ModuleLoader__.load({
         applied = false
       }, 'drag-graft: listeners')
 
-      // 调试钩子（CDP 用）：暴露内部状态与插入函数，方便定位 launcher 失败原因。
+      // 调试钩子（F12 / CDP 用）：只读为主，定位「为什么没插进去」。
       try {
         window.__dragGraft = {
+          version: '2.1.0',
           state: () => ({
             currentSessionId,
             hasInputTriggers: Boolean(inputTriggers),
+            hasInputActions: Boolean(inputActionsRef),
             hasScope: Boolean(sessions.scope?.(currentSessionId)),
-            lastTrack,
+            limits: hostLimits,
+            maxReferences: maxReferences(),
+            refCount: referenceCount(),
             sessionsCount: (sessionStore().ids ?? []).length,
           }),
-          controller: () => {
-            const scope = sessions.scope?.(currentSessionId)
-            if (!scope || !inputTriggers?.sessionOf) return null
-            const c = inputTriggers.sessionOf(scope)
-            return {
-              keys: Object.keys(c ?? {}),
-              hasToggleSource: typeof c?.toggleSource === 'function',
-              hasPick: typeof c?.pick === 'function',
-              menu: (() => { try { const s = c?.menu?.getSnapshot?.(); return s?.state ?? s ?? null } catch (e) { return String(e) } })(),
-            }
-          },
-          insert: (id, title) => insertChipByRevs(id, title),
-          insertLegacy: (id, title) => insertChipViaLauncher(id, title),
+          limits: () => hostLimits,
+          refreshLimits: () => refreshLimits(),
+          span: () => captureSpan(),
+          refCount: () => referenceCount(),
+          insert: (id, title) => insertChip(id, title),
           send: (id, title) => dropReference(id, title),
-          // 分步调试：打开 reference 菜单（不拾取）。spanMode: 'zero' | 'none' | 数字(draftRev)
-          open: async (spanMode = 'zero', query = '', caret = 0) => {
-            const scope = sessions.scope?.(currentSessionId)
-            if (!scope) return { error: 'no scope' }
-            const c = inputTriggers.sessionOf(scope)
-            if (!c?.toggleSource) return { error: 'no toggleSource' }
-            let span
-            if (spanMode === 'none') span = undefined
-            else if (typeof spanMode === 'number') span = { start: caret, end: caret, draftRev: spanMode }
-            else span = { start: caret, end: caret }
-            const hit = { trigger: '@', query, quoted: false, position: 'leading', ...(span === undefined ? {} : { span }) }
-            try { c.toggleSource('reference', hit) } catch (error) { return { error: String(error?.message ?? error) } }
-            await new Promise((resolve) => setTimeout(resolve, 500))
-            let st = null
-            try { const snap = c.menu.getSnapshot?.(); st = snap?.state ?? snap } catch (error) { return { error: String(error) } }
-            return {
-              open: st?.open ?? null,
-              hit: c.hit ?? null,
-              depsKeys: Object.keys(c.deps ?? {}),
-              groups: (st?.groups ?? []).map((g) => ({
-                source: g.source, status: g.status,
-                items: (g.items ?? []).map((i) => i.label ?? i.name).slice(0, 6),
-              })),
-            }
-          },
-          // 分步调试：拾取当前菜单里的第 index 条
-          pick: async (index = 0) => {
-            const scope = sessions.scope?.(currentSessionId)
-            if (!scope) return { error: 'no scope' }
-            const c = inputTriggers.sessionOf(scope)
-            const before = document.querySelector('[data-composer-input]')?.textContent ?? ''
-            try { c.pick('reference', index) } catch (error) { return { error: String(error?.message ?? error), before } }
-            await new Promise((resolve) => setTimeout(resolve, 400))
-            return { before, after: document.querySelector('[data-composer-input]')?.textContent ?? '' }
-          },
         }
       } catch (error) { console.warn('[drag-graft] debug hook failed:', error) }
     }
