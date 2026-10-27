@@ -10,6 +10,18 @@ reference and your question.
 
 [中文 README](README.md)
 
+![Drag a conversation row from the sidebar, drop it, and a native reference chip appears in the composer](assets/demo-drag.gif)
+
+Three drags in a row, then send — the message carries "referenced sessions · 1, 2, 3". Real DSH window,
+recorded at normal speed with the drags left intact:
+
+![After sending: one message referencing sessions 1, 2 and 3](assets/shot-references.png)
+
+A second recording runs the whole loop — drop a reference, type the body, send, and the message header
+reads "referenced sessions · 1" (the sidebar's workspace list is blurred):
+
+![Full loop: the reference chip sits in the composer, the body is typed, and the sent message header reads "referenced sessions · 1"](assets/demo-full-flow.gif)
+
 ---
 
 ## Quick start (install and go)
