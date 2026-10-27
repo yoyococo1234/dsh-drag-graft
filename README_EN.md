@@ -59,7 +59,27 @@ The plugin asks the host for the real value (`draggraft.limits`) and follows it:
 - Stock host: **3** — the plugin blocks the 4th drop instead of letting you build a message the host will reject.
 - Patched host (e.g. raised to 100): the plugin relaxes automatically, no plugin change needed.
 
-> Raising the cap means patching the host (`app.asar`), which is out of scope for this plugin and not recommended for regular users.
+> Raising the cap means patching the host (`app.asar`), which is out of scope for this plugin.
+>
+> **You can hand that job to your own agent.** Open a new conversation and paste this:
+>
+> ```text
+> Raise the session-reference cap in the DSH host (@deepseek-ai/dsh-session-reference) from 3 to
+> something like 100, so plugins like dsh-drag-graft can carry more conversations per message.
+>
+> Notes:
+> 1. MAX_REFERENCES appears in more than one place: the const, the Config schema's .max(3).default(3),
+>    and a hard `> 3` check in the constructor. All three must change; leaving one behind fails with
+>    SESSION_REFERENCE_INVALID_CONFIG.
+> 2. Repack app.asar afterwards: header layout [4][size][fieldSize][jsonLen][json][pad4], data starts
+>    at 8+size, and every file's offset/size and integrity (sha256 + 4MB blocks) must be recomputed.
+> 3. DSH must be fully quit before swapping the asar (otherwise it is locked), then start it and probe
+>    the listening port as a health check; roll back automatically on failure.
+> 4. Every DSH update overwrites app.asar and resets the cap to 3, so make it a repeatable script.
+> ```
+>
+> Nothing to change in this plugin: it re-reads the cap from the host before every insert
+> (`__dragGraft.refreshLimits()` forces a re-read).
 
 ### Fallback
 

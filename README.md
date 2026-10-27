@@ -58,7 +58,25 @@ DSH → 设置 → 插件 → 安装 → 输入包名 `dsh-drag-graft` → 安�
 - 原版 DSH：**3 个**（`@deepseek-ai/dsh-session-reference` 的 `MAX_REFERENCES = 3`），第 4 个会在发送时被整轮拒绝，所以插件在拖第 4 个时就拦住你并提示。
 - 如果你的宿主被打过补丁（例如把上限改到 100），插件会自动放宽，不需要改插件。
 
-> 想突破 3：那属于改宿主（重打包 `app.asar`），不是本插件的能力范围，也不建议普通用户做。
+> 想突破 3：那属于改宿主（重打包 `app.asar`），不是本插件的能力范围。
+>
+> **但这件事可以直接丢给你的 AI 做。** 开一个新对话，把下面这段贴给它：
+>
+> ```text
+> 帮我把 DSH 宿主里 @deepseek-ai/dsh-session-reference 的会话引用上限从 3 改大（比如 100），
+> 让 dsh-drag-graft 这类插件一条消息能拖进更多对话。
+>
+> 要点：
+> 1. MAX_REFERENCES 不止一处：const 常量、Config schema 的 .max(3).default(3)、构造函数里的 > 3
+>    硬校验，三处都要改；只改一处会被另一处拒绝（SESSION_REFERENCE_INVALID_CONFIG）。
+> 2. 改完要重打包 app.asar：头布局 [4][size][fieldSize][jsonLen][json][pad4]，数据起点 8+size，
+>    重算每个 file 的 offset/size 和 integrity（sha256 + 4MB blocks）。
+> 3. 换包前必须完全退出 DSH（asar 被占用会报「正由另一进程使用」），换完起进程并探监听端口做
+>    健康检查，失败自动回滚。
+> 4. DSH 每次更新会整包覆盖 app.asar，上限会回到 3，所以请做成可重复执行的脚本。
+> ```
+>
+> 改完之后不用动本插件：它每次插入前都会重新向宿主读一次上限（`__dragGraft.refreshLimits()` 可手动重读）。
 
 ### 插入失败时的兜底
 
