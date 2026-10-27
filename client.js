@@ -1,4 +1,4 @@
-// @local/drag-graft — Browser half (v2.1.0)
+// @local/drag-graft — Browser half (v2.1.1)
 //
 // 把侧边栏的会话行拖到对话区松手 → 在输入框里插一枚**原生会话引用 chip**，
 // 你可以继续打字，然后自己按发送。
@@ -34,6 +34,9 @@ window.__ModuleLoader__.load({
     const POLL_TIMEOUT = 5000
     /** 宿主原版上限。真实值在运行时从宿主半区读，读不到就按这个保守值。 */
     const DEFAULT_MAX_REFERENCES = 3
+    /** 底部提示的停留时长：普通 1.5s、报错 4.5s（比早期版本各砍一半）。 */
+    const TOAST_MS = 1500
+    const TOAST_ERROR_MS = 4500
     const PROBE_ID = 'drag-graft-probe'
 
     // connection 用来问宿主「你这条消息最多收几个引用」，读不到就按 3 处理。
@@ -184,7 +187,7 @@ window.__ModuleLoader__.load({
           const timer = setTimeout(() => {
             timers.delete(timer)
             try { el.remove() } catch { /* ignore */ }
-          }, isError ? 9000 : 3000)
+          }, isError ? TOAST_ERROR_MS : TOAST_MS)
           timers.add(timer)
         } catch (error) { console.warn('[drag-graft] toast failed:', error) }
       }
@@ -540,7 +543,7 @@ window.__ModuleLoader__.load({
       // 调试钩子（F12 / CDP 用）：只读为主，定位「为什么没插进去」。
       try {
         window.__dragGraft = {
-          version: '2.1.0',
+          version: '2.1.1',
           state: () => ({
             currentSessionId,
             hasInputTriggers: Boolean(inputTriggers),
