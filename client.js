@@ -1,4 +1,4 @@
-// @local/drag-graft — Browser half (v2.1.1)
+// @local/drag-graft — Browser half (v2.1.2)
 //
 // 把侧边栏的会话行拖到对话区松手 → 在输入框里插一枚**原生会话引用 chip**，
 // 你可以继续打字，然后自己按发送。
@@ -55,6 +55,28 @@ window.__ModuleLoader__.load({
 
     const formatMention = (sessionId, label) =>
       `@[${escapeLabel(label || sessionId)}](${encodeSessionUri(sessionId)})`
+
+    /**
+     * 反向解码：把候选里的 mention / ref 还原成 session id（格式同上，宿主契约）。
+     * 标题会重名、会为空，只有 id 是唯一可信的身份。
+     */
+    const decodeSessionUri = (raw) => {
+      try {
+        const text = String(raw ?? '')
+        const at = text.indexOf('dsh-session:')
+        if (at < 0) return null
+        let payload = text.slice(at + 'dsh-session:'.length)
+        const stop = payload.search(/[)\s"'<>]/)
+        if (stop >= 0) payload = payload.slice(0, stop)
+        if (!/^[A-Za-z0-9_-]+$/.test(payload)) return null
+        const base64 = payload.replace(/-/g, '+').replace(/_/g, '/')
+        const padded = base64.padEnd(Math.ceil(base64.length / 4) * 4, '=')
+        const binary = atob(padded)
+        const bytes = Uint8Array.from(binary, (ch) => ch.charCodeAt(0))
+        const parsed = JSON.parse(new TextDecoder().decode(bytes))
+        return typeof parsed === 'string' && parsed ? parsed : null
+      } catch { return null }
+    }
 
     // ── 从拖拽里取出会话 id ──────────────────────────────────────────────────
     const normalizeId = (raw) => {
@@ -131,10 +153,14 @@ window.__ModuleLoader__.load({
 
     /** 草稿里的一条 occurrence 是不是「会话引用」（文件/目录引用不占宿主配额）。 */
     const isSessionOccurrence = (item) => {
-      if (!item || typeof item !== 'object') return true
+      if (typeof item === 'string') return item.startsWith('dsh-session:')
+      if (!item || typeof item !== 'object') return false
       const appearance = item.appearance ?? item.kind
       if (typeof appearance === 'string') return appearance === 'session'
-      return String(item.ref ?? '').startsWith('dsh-session:')
+      const ref = item.ref
+      if (typeof ref === 'string') return ref.startsWith('dsh-session:')
+      // 形状未知：保守地当成会话引用（宁可早拦，也别让宿主整轮拒绝）
+      return true
     }
 
     // ── apply ────────────────────────────────────────────────────────────────
@@ -207,7 +233,7 @@ window.__ModuleLoader__.load({
         } catch { return 0 }
       }
       const warnTooMany = () => {
-        toast(`一条消息最多 ${maxReferences()} 个会话引用（宿主上限）。再多的请分条发，或用 graft_forward 把内容当正文带进来。`, true)
+        toast(`一条消息最多 ${maxReferences()} 个会话引用（宿主上限）。再多的请分两条发，或在宿主侧把这个上限调大。`, true)
       }
       const refreshLimits = async () => {
         try {
@@ -233,36 +259,73 @@ window.__ModuleLoader__.load({
 
       // ── 自引用防护 ────────────────────────────────────────────────────────
       // 宿主对「消息引用了自己这个会话」是硬拒绝：session "…" cannot reference itself。
-      /** 这条候选是不是当前会话自己（item 里带 session id 时才算得出）。 */
+      /**
+       * 一条候选的身份：kind（session / file / folder）+ sessionId。
+       * 宿主 ui-reference 的候选形如 { name, value: JSON.stringify({ kind, mention, label }) }，
+       * mention 里的 dsh-session:base64url 是唯一可信的身份——标题会重名、会为空，
+       * 只有 id 不会。
+       */
+      const candidateRef = (item) => {
+        if (!item || typeof item !== 'object') return null
+        let parsed = null
+        if (typeof item.value === 'string') {
+          try { parsed = JSON.parse(item.value) } catch { parsed = null }
+        }
+        const bag = parsed && typeof parsed === 'object' ? parsed : null
+        const kind = bag?.kind ?? item.kind ?? item.appearance ?? null
+        let sessionId = typeof bag?.sessionId === 'string'
+          ? bag.sessionId
+          : typeof item.sessionId === 'string' ? item.sessionId : null
+        if (!sessionId) sessionId = decodeSessionUri(bag?.mention ?? item.mention ?? item.ref ?? '')
+        if (!sessionId && (kind === null || kind === 'session') && typeof item.id === 'string') sessionId = item.id
+        return { kind: typeof kind === 'string' ? kind : null, sessionId: sessionId || null }
+      }
+
+      /** 这条候选是不是当前会话自己。有 id 就按 id 判，判不出来才退回文本比对。 */
       const itemRefersToSelf = (item) => {
         if (!currentSessionId) return false
+        const ref = candidateRef(item)
+        if (ref?.sessionId) return ref.sessionId === currentSessionId
         try { return JSON.stringify(item ?? {}).includes(currentSessionId) } catch { return false }
       }
 
       /**
-       * 在候选里按标题挑一条：先精确匹配，再允许唯一的前缀/包含匹配。
-       * 自引用候选一律跳过；匹配不到或有歧义就返回 -1（**绝不盲选第一条**——
-       * 第一条往往就是最近/当前会话，盲选会把错的会话塞进草稿）。
+       * 在候选里挑出「被拖的那个会话」。
+       * 先按 session id 精确命中（唯一可信）；候选里根本没有 id 信息时才退回标题匹配。
+       * 匹配不到或有歧义一律返回 -1——**绝不盲选**，盲选会把错的会话塞进草稿。
        */
-      const pickIndexFor = (items, title) => {
+      const pickIndexFor = (items, title, wantedId) => {
         const list = Array.isArray(items) ? items : []
-        const labelOf = (index) => String(list[index]?.label ?? list[index]?.name ?? '').trim().toLowerCase()
         const usable = []
         for (let index = 0; index < list.length; index += 1) {
-          if (itemRefersToSelf(list[index])) continue
-          usable.push(index)
+          const item = list[index]
+          const ref = candidateRef(item)
+          if (ref?.kind === 'file' || ref?.kind === 'folder') continue // 文件候选不是会话引用
+          if (itemRefersToSelf(item)) continue
+          usable.push({
+            index,
+            sessionId: ref?.sessionId ?? null,
+            label: String(item?.label ?? item?.name ?? '').trim().toLowerCase(),
+          })
         }
         if (!usable.length) return -1
-        const wanted = String(title ?? '').trim().toLowerCase()
-        if (!wanted) return usable.length === 1 ? usable[0] : -1
-        const exact = usable.filter((index) => labelOf(index) === wanted)
-        if (exact.length === 1) return exact[0]
-        if (wanted.length >= 4) {
-          const loose = usable.filter((index) => {
-            const label = labelOf(index)
-            return label.length >= 4 && (label.startsWith(wanted) || wanted.startsWith(label))
-          })
-          if (loose.length === 1) return loose[0]
+
+        const wanted = String(wantedId ?? '')
+        if (wanted) {
+          const byId = usable.filter((entry) => entry.sessionId === wanted)
+          if (byId.length === 1) return byId[0].index
+          // 候选里已经有 id 信息却没有目标：标题再像也不能选
+          if (!byId.length && usable.some((entry) => entry.sessionId)) return -1
+        }
+
+        const wantedTitle = String(title ?? '').trim().toLowerCase()
+        if (!wantedTitle) return -1
+        const exact = usable.filter((entry) => entry.label === wantedTitle)
+        if (exact.length === 1) return exact[0].index
+        if (wantedTitle.length >= 4) {
+          const loose = usable.filter((entry) => entry.label.length >= 4
+            && (entry.label.startsWith(wantedTitle) || wantedTitle.startsWith(entry.label)))
+          if (loose.length === 1) return loose[0].index
         }
         return -1
       }
@@ -315,11 +378,11 @@ window.__ModuleLoader__.load({
         return all.length ? all[all.length - 1] : null
       }
 
-      const resolveDropId = (event) => {
+      const resolveDropId = (event, element) => {
         const byId = sessionStore().byId ?? {}
         const fromTransfer = idFromTransfer(event?.dataTransfer)
         if (fromTransfer) return fromTransfer
-        if (dragElement?.isConnected) return idFromElement(dragElement, byId)
+        if (element?.isConnected) return idFromElement(element, byId)
         return null
       }
 
@@ -365,7 +428,7 @@ window.__ModuleLoader__.load({
               if (!state?.open) break
               const group = (state.groups ?? []).find((g) => g?.source === 'reference' && g?.status === 'ready' && (g?.items?.length ?? 0) > 0)
               if (!group) continue
-              const matched = pickIndexFor(group.items, title)
+              const matched = pickIndexFor(group.items, title, sourceId)
               // 候选已就绪但没有目标：换一次尝试也不会变出目标，立刻放弃（交给直发兜底）
               if (matched < 0) { noMatch = true; break }
               index = matched
@@ -451,13 +514,14 @@ window.__ModuleLoader__.load({
 
       const onDrop = (event) => {
         const source = dragSource
+        const element = dragElement
         dragSource = null
         dragElement = null
         if (!source || isFileDrag(event)) return
         if (insideSidebarRow(event.target)) return
         event.preventDefault()
         event.stopPropagation()
-        const id = resolveDropId(event) ?? source.id
+        const id = resolveDropId(event, element) ?? source.id
         if (!id) {
           toast('没认出被拖的是哪个对话（拖拽数据里没有会话 id）。', true)
           return
@@ -543,7 +607,7 @@ window.__ModuleLoader__.load({
       // 调试钩子（F12 / CDP 用）：只读为主，定位「为什么没插进去」。
       try {
         window.__dragGraft = {
-          version: '2.1.1',
+          version: '2.1.2',
           state: () => ({
             currentSessionId,
             hasInputTriggers: Boolean(inputTriggers),

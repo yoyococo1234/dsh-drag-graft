@@ -15,10 +15,22 @@ const clientPath = join(here, '..', 'client.js')
 
 const SELF = 'session-11111111-2222-3333-4444-555555555555'
 const OTHER = 'session-99999999-8888-7777-6666-555555555555'
+const THIRD = 'session-77777777-6666-5555-4444-333333333333'
 let bootCounter = 0
+
+/** 真实宿主的候选形状：{ name, value: JSON.stringify({ kind, mention, label }) }。 */
+const hostItem = (sessionId, label) => ({
+  name: label,
+  value: JSON.stringify({
+    kind: 'session',
+    mention: `@[${label}](dsh-session:${Buffer.from(JSON.stringify(sessionId), 'utf8').toString('base64url')})`,
+    label,
+  }),
+})
 
 function buildHarness (options = {}) {
   const hostMax = options.hostMax ?? 3
+  const items = options.items ?? [{ label: '别的对话', id: OTHER }, { label: '本对话标题', id: SELF }]
   const toasts = []
   const pickCalls = []
   const promptCalls = []
@@ -46,7 +58,8 @@ function buildHarness (options = {}) {
     pick: (source, index) => {
       pickCalls.push({ source, index })
       // 模拟官方插入：草稿变化 + rev 递增
-      const label = controller.menu.getSnapshot().state.groups[0].items[index]?.label ?? ''
+      const item = controller.menu.getSnapshot().state.groups[0].items[index]
+      const label = item?.label ?? item?.name ?? ''
       editor.textContent += `[${label}]`
       rev += 1
     },
@@ -58,7 +71,7 @@ function buildHarness (options = {}) {
             source: 'reference',
             status: 'ready',
             // 同时包含「别的对话」和「当前对话自己」，后者必须被跳过
-            items: [{ label: '别的对话', id: OTHER }, { label: '本对话标题', id: SELF }],
+            items,
           }],
         },
       }),
@@ -140,6 +153,7 @@ async function boot (options = {}) {
   globalThis.window = { __ModuleLoader__: { load: (cfg) => { captured = cfg } } }
   globalThis.document = harness.documentStub
   globalThis.btoa = (s) => Buffer.from(s, 'binary').toString('base64')
+  globalThis.atob = (s) => Buffer.from(s, 'base64').toString('binary')
   globalThis.TextEncoder = TextEncoder
   globalThis.DataTransfer = class { constructor () { this.map = new Map() } setData (k, v) { this.map.set(k, v) } getData (k) { return this.map.get(k) ?? '' } }
   globalThis.ClipboardEvent = class { constructor (type, init) { this.type = type; Object.assign(this, init) } }
@@ -209,18 +223,29 @@ test('拖当前对话自己：只提示，不插 chip、不发消息', async () 
   assert.ok(h.toasts.some((t) => String(t).includes('不能引用自己')), '应给出自引用提示')
 })
 
-test('候选里没有同名会话：不 pick，不做盲选兜底', async () => {
+test('候选里没有目标会话：不 pick，不做盲选兜底', async () => {
   const h = await boot()
   const insert = globalThis.window.__dragGraft?.insert
   assert.equal(typeof insert, 'function', '调试钩子 insert 应可用')
 
   const startedAt = Date.now()
-  const ok = await insert(OTHER, '根本不存在的对话')
+  // THIRD 根本不在候选里，标题也不像任何一条：绝不能顺手拿第一条
+  const ok = await insert(THIRD, '根本不存在的对话')
   await flush()
 
   assert.equal(ok, false, '匹配不到应返回 false')
   assert.equal(h.pickCalls.length, 0, '匹配不到时绝不能 pick 第一条')
   assert.ok(Date.now() - startedAt < 3000, '匹配不到应快速放弃')
+})
+
+test('标题对不上但 id 命中：按 id 插（标题可能刚被改过）', async () => {
+  const h = await boot({ hostMax: 100 })
+  const insert = globalThis.window.__dragGraft?.insert
+
+  const ok = await insert(OTHER, '这个标题已经不在了')
+
+  assert.equal(ok, true, 'id 命中时不该被过期标题挡住')
+  assert.equal(h.pickCalls[0].index, 0)
 })
 
 test('直发兜底 dropReference 也拦自引用', async () => {
@@ -304,4 +329,65 @@ test('文件引用不占会话引用配额', async () => {
   await waitFor(() => h.pickCalls.length > 0)
 
   assert.equal(h.pickCalls.length, 1, '应当正常插入会话引用')
+})
+
+// ── 候选身份：按 session id 命中，而不是靠标题猜 ─────────────────────────────
+// 真实宿主的候选是 { name, value: JSON.stringify({ kind, mention, label }) }，
+// 标题会重名、会为空、可能和文件名撞，只有 mention 里的 id 是唯一可信的身份。
+
+test('两个会话同名：按 id 命中被拖的那个，不靠标题猜', async () => {
+  const h = await boot({ hostMax: 100, items: [hostItem(OTHER, '同名对话'), hostItem(THIRD, '同名对话')] })
+  const insert = globalThis.window.__dragGraft?.insert
+
+  const ok = await insert(THIRD, '同名对话')
+
+  assert.equal(ok, true, '有 id 信息时应能插入')
+  assert.equal(h.pickCalls.length, 1)
+  assert.equal(h.pickCalls[0].index, 1, '必须选中 id 匹配的那一条（index 1），而不是第一条')
+})
+
+test('标题为空且只有一个候选：不盲选，交回兜底', async () => {
+  const h = await boot({ hostMax: 100, items: [hostItem(OTHER, '别的对话')] })
+  const insert = globalThis.window.__dragGraft?.insert
+
+  // 被拖的会话（THIRD）根本不在候选里，标题又为空——不能顺手把唯一候选塞进草稿
+  const ok = await insert(THIRD, '')
+
+  assert.equal(ok, false, '标题为空且 id 不匹配时必须放弃')
+  assert.equal(h.pickCalls.length, 0, '绝不能盲选唯一候选')
+})
+
+test('候选里混着同名文件：只认会话候选，不插文件引用', async () => {
+  const h = await boot({
+    hostMax: 100,
+    items: [
+      { name: '设计稿', value: JSON.stringify({ kind: 'file', mention: '@assets/设计稿.png', label: '设计稿' }) },
+      hostItem(OTHER, '设计稿'),
+    ],
+  })
+  const insert = globalThis.window.__dragGraft?.insert
+
+  const ok = await insert(OTHER, '设计稿')
+
+  assert.equal(ok, true)
+  assert.equal(h.pickCalls.length, 1)
+  assert.equal(h.pickCalls[0].index, 1, '文件候选必须被跳过，选会话那条')
+})
+
+test('真实候选形状下，当前会话自己按 id 被跳过', async () => {
+  const h = await boot({ hostMax: 100, items: [hostItem(SELF, '同名标题'), hostItem(OTHER, '同名标题')] })
+  const insert = globalThis.window.__dragGraft?.insert
+
+  const ok = await insert(OTHER, '同名标题')
+
+  assert.equal(ok, true)
+  assert.equal(h.pickCalls[0].index, 1, '自己的候选（index 0）必须被跳过')
+})
+
+test('occurrences 里的空值不计入会话引用配额', async () => {
+  const h = await boot({ hostMax: 3 })
+
+  h.renderProbe([null, undefined, 'dsh-session:abc', { appearance: 'file' }, { appearance: 'session' }])
+
+  assert.equal(globalThis.window.__dragGraft.refCount(), 2, '只数 dsh-session 字符串和 session 外观的两条')
 })

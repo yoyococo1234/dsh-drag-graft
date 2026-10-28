@@ -17,7 +17,7 @@
 
 export const name = 'dsh-drag-graft'
 export const CHANNEL = '/drag-graft'
-export const PLUGIN_VERSION = '2.1.1'
+export const PLUGIN_VERSION = '2.1.2'
 
 /** 只需要官方 Session 控制器；不注入未文档化的服务名。 */
 export const inject = ['sessionController']
