@@ -1,4 +1,4 @@
-// @local/drag-graft — Browser half (v2.1.2)
+// @local/drag-graft — Browser half (v2.2.0)
 //
 // 把侧边栏的会话行拖到对话区松手 → 在输入框里插一枚**原生会话引用 chip**，
 // 你可以继续打字，然后自己按发送。
@@ -151,6 +151,59 @@ window.__ModuleLoader__.load({
       return false
     }
 
+    // ── 工作区（文件夹）行 ────────────────────────────────────────────────────
+    // 宿主把「装着对话的那个文件夹」渲染成 data-row-key="workspace:<key>" 的行，
+    // 行本身可拖（组内排序用），text/plain 里放的是 row.key 而不是路径。
+    // 真实路径只在这个行的 React props 里：ProjectRowItem 的 props.group.cwd。
+    const FOLDER_ROW_PREFIX = 'workspace:'
+
+    const rowKeyOf = (el) => {
+      let node = el
+      for (let depth = 0; node && depth < 12; depth += 1, node = node.parentElement) {
+        try {
+          const key = node.getAttribute?.('data-row-key')
+          if (typeof key === 'string' && key) return key
+        } catch { /* ignore */ }
+      }
+      return null
+    }
+
+    /** 从被拖的行往上找 props.group，取出工作区目录与显示名。 */
+    const folderPropsOf = (el) => {
+      let node = el
+      for (let depth = 0; node && depth < 12; depth += 1, node = node.parentElement) {
+        try {
+          const fiberKey = Object.getOwnPropertyNames(node).find((k) => k.startsWith('__reactFiber$'))
+          if (!fiberKey) continue
+          let fiber = node[fiberKey]
+          for (let hop = 0; fiber && hop < 26; hop += 1, fiber = fiber.return) {
+            const props = fiber.memoizedProps
+            if (!props || typeof props !== 'object') continue
+            const group = props.group ?? props.workspace ?? null
+            const path = group?.cwd ?? group?.path ?? props.cwd ?? props.path ?? null
+            if (typeof path === 'string' && path) {
+              const label = group?.label ?? group?.title ?? props.label ?? ''
+              return { path, label: typeof label === 'string' ? label : '' }
+            }
+          }
+        } catch { /* ignore */ }
+      }
+      return null
+    }
+
+    /** 这一行是不是工作区（文件夹）行；是就返回它的真实目录。 */
+    const folderFromElement = (el) => {
+      const key = rowKeyOf(el)
+      if (!key || !key.startsWith(FOLDER_ROW_PREFIX)) return null
+      return folderPropsOf(el)
+    }
+
+    /** 文件夹引用：宿主文法里目录带尾斜杠，含空白就加引号。 */
+    const formatFolderMention = (path) => {
+      const normalized = String(path).replace(/\\/g, '/').replace(/\/+$/u, '') + '/'
+      return /\s/u.test(normalized) ? `@"${normalized}"` : `@${normalized}`
+    }
+
     /** 草稿里的一条 occurrence 是不是「会话引用」（文件/目录引用不占宿主配额）。 */
     const isSessionOccurrence = (item) => {
       if (typeof item === 'string') return item.startsWith('dsh-session:')
@@ -187,6 +240,7 @@ window.__ModuleLoader__.load({
       let currentSessionId = null
       let composerAnchor = null // 输入卡片内的隐藏锚点，用来定位输入框
       let dragSource = null // { id, title }
+      let dragFolder = null // { path, label } —— 侧栏工作区（文件夹）行
       let dragElement = null
       let inserting = false // 正在插 chip（防连拖叠加）
       let sending = false // 正在直发兜底
@@ -484,14 +538,58 @@ window.__ModuleLoader__.load({
         }
       }
 
+      /**
+       * 把侧栏那个工作区（文件夹）插成草稿里的路径引用。
+       * 走官方的 inputActions.insertText(text, span)：span 用 captureInsertion() 现取，
+       * 与插 chip 同一条 CAS 通道，插进去的是一次可撤销的编辑。
+       */
+      const insertFolderRef = async (path, label) => {
+        try {
+          const span = captureSpan()
+          if (!span) {
+            toast('拿不到官方插入位点，文件夹插不进草稿。刷新页面后再试。', true)
+            return false
+          }
+          const editor = findComposerEditor()
+          const before = editor?.textContent ?? ''
+          const text = formatFolderMention(path)
+          let applied = false
+          try {
+            applied = Boolean(inputActionsRef?.insertText?.(text, span))
+          } catch (error) {
+            console.warn('[drag-graft] insertText 失败：', error?.message ?? error)
+          }
+          await new Promise((resolve) => setTimeout(resolve, 120))
+          const after = (findComposerEditor() ?? editor)?.textContent ?? ''
+          if (applied || after !== before) {
+            console.info('[drag-graft] folder reference inserted:', text)
+            try { (findComposerEditor() ?? editor)?.focus?.() } catch { /* 焦点拿不到不影响插入 */ }
+            return true
+          }
+          toast(`文件夹引用没插进草稿：${label || path}。再拖一次试试。`, true)
+          return false
+        } catch (error) {
+          toast(`插入文件夹引用失败：${error?.message ?? String(error)}`, true)
+          console.warn('[drag-graft] insert folder failed:', error)
+          return false
+        }
+      }
+
       // ── 拖拽拦截：只认「非文件 + 落在对话区（非侧栏行）」的投放 ────────────
       const onDragStart = (event) => {
         dragElement = null
         dragSource = null
+        dragFolder = null
         try {
           if (isFileDrag(event)) return
-          const byId = sessionStore().byId ?? {}
           dragElement = event.target ?? null
+          const folder = folderFromElement(event.target)
+          if (folder) {
+            dragFolder = folder
+            console.info('[drag-graft] dragging folder', folder)
+            return
+          }
+          const byId = sessionStore().byId ?? {}
           const fromTransfer = idFromTransfer(event.dataTransfer)
           const id = (fromTransfer && byId[fromTransfer] !== undefined ? fromTransfer : null)
             ?? idFromElement(event.target, byId)
@@ -502,23 +600,33 @@ window.__ModuleLoader__.load({
           console.info('[drag-graft] dragging', dragSource)
         } catch (error) {
           dragSource = null
+          dragFolder = null
           console.warn('[drag-graft] dragstart 识别失败：', error)
         }
       }
 
       const onDragOver = (event) => {
-        if (!dragSource || isFileDrag(event)) return
+        if ((!dragSource && !dragFolder) || isFileDrag(event)) return
         if (insideSidebarRow(event.target)) return // 侧栏内部：交给官方与 workspace-mover
         event.preventDefault() // 没有这一行 drop 不会触发
       }
 
       const onDrop = (event) => {
         const source = dragSource
+        const folder = dragFolder
         const element = dragElement
         dragSource = null
+        dragFolder = null
         dragElement = null
-        if (!source || isFileDrag(event)) return
+        if (isFileDrag(event)) return
         if (insideSidebarRow(event.target)) return
+        if (folder) {
+          event.preventDefault()
+          event.stopPropagation()
+          void insertFolderRef(folder.path, folder.label)
+          return
+        }
+        if (!source) return
         event.preventDefault()
         event.stopPropagation()
         const id = resolveDropId(event, element) ?? source.id
@@ -559,7 +667,7 @@ window.__ModuleLoader__.load({
       listen('dragstart', onDragStart, true)
       listen('dragover', onDragOver, true)
       listen('drop', onDrop, true)
-      listen('dragend', () => { dragSource = null; dragElement = null }, true)
+      listen('dragend', () => { dragSource = null; dragFolder = null; dragElement = null }, true)
 
       // ── 不可见探针：接住宿主发来的 sessionId / inputActions / useInput ──────
       const Probe = (props) => {
@@ -607,7 +715,7 @@ window.__ModuleLoader__.load({
       // 调试钩子（F12 / CDP 用）：只读为主，定位「为什么没插进去」。
       try {
         window.__dragGraft = {
-          version: '2.1.2',
+          version: '2.2.0',
           state: () => ({
             currentSessionId,
             hasInputTriggers: Boolean(inputTriggers),
@@ -623,6 +731,7 @@ window.__ModuleLoader__.load({
           span: () => captureSpan(),
           refCount: () => referenceCount(),
           insert: (id, title) => insertChip(id, title),
+          folder: (path, label) => insertFolderRef(path, label),
           send: (id, title) => dropReference(id, title),
         }
       } catch (error) { console.warn('[drag-graft] debug hook failed:', error) }

@@ -85,6 +85,7 @@ function buildHarness (options = {}) {
 
   const inputActions = {
     captureInsertion: () => ({ start: editor.textContent.length, end: editor.textContent.length, draftRev: rev }),
+    insertText: (text) => { editor.textContent += text; rev += 1; return true },
   }
 
   const ctx = {
@@ -390,4 +391,83 @@ test('occurrences 里的空值不计入会话引用配额', async () => {
   h.renderProbe([null, undefined, 'dsh-session:abc', { appearance: 'file' }, { appearance: 'session' }])
 
   assert.equal(globalThis.window.__dragGraft.refCount(), 2, '只数 dsh-session 字符串和 session 外观的两条')
+})
+
+// ── 工作区（文件夹）行：拖进输入框 = 插入该文件夹的路径引用 ──────────────────
+// 宿主的文件夹行是 data-row-key="workspace:<key>"，真实目录只在 React props 的
+// group.cwd 里，所以这里连 fiber 一起模拟。
+
+const folderRow = (path, label) => {
+  const el = {
+    getAttribute: (name) => (name === 'data-row-key' ? `workspace:${path}` : null),
+    parentElement: null,
+  }
+  Object.defineProperty(el, '__reactFiber$test', {
+    value: { memoizedProps: { group: { cwd: path, label } }, return: null },
+    enumerable: false,
+  })
+  return el
+}
+
+const chatTarget = () => ({ getAttribute: () => null, parentElement: null })
+
+const dropOn = (target) => ({
+  dataTransfer: { types: ['text/plain'], getData: () => '' },
+  target,
+  preventDefault: () => {},
+  stopPropagation: () => {},
+})
+
+test('拖左侧工作区（文件夹）行：插成文件夹路径引用', async () => {
+  const h = await boot({ hostMax: 100 })
+  const dragStart = h.listeners.get('dragstart')?.[0]
+  const drop = h.listeners.get('drop')?.[0]
+  const row = folderRow('C:\\Users\\Lenovo\\Desktop', 'Desktop')
+
+  dragStart({ dataTransfer: { types: ['text/plain'], getData: () => 'workspace:Desktop' }, target: row })
+  drop(dropOn(chatTarget()))
+  await waitFor(() => h.editor.textContent.length > 0)
+
+  assert.equal(h.editor.textContent, '@C:/Users/Lenovo/Desktop/', '反斜杠要规范成斜杠，目录带尾斜杠')
+  assert.equal(h.pickCalls.length, 0, '文件夹不走 @ 候选菜单')
+})
+
+test('文件夹路径含空格：加引号', async () => {
+  const h = await boot({ hostMax: 100 })
+  const dragStart = h.listeners.get('dragstart')?.[0]
+  const drop = h.listeners.get('drop')?.[0]
+  const row = folderRow('D:\\我的 项目', '我的 项目')
+
+  dragStart({ dataTransfer: { types: ['text/plain'], getData: () => 'workspace:x' }, target: row })
+  drop(dropOn(chatTarget()))
+  await waitFor(() => h.editor.textContent.length > 0)
+
+  assert.equal(h.editor.textContent, '@"D:/我的 项目/"')
+})
+
+test('文件夹行落在侧栏内部：不抢，交给宿主排序', async () => {
+  const h = await boot({ hostMax: 100 })
+  const dragStart = h.listeners.get('dragstart')?.[0]
+  const drop = h.listeners.get('drop')?.[0]
+  const row = folderRow('C:\\Users\\Lenovo\\Desktop', 'Desktop')
+
+  dragStart({ dataTransfer: { types: ['text/plain'], getData: () => 'workspace:x' }, target: row })
+  // 落点本身是另一个工作区行
+  drop(dropOn(folderRow('D:\\other', 'other')))
+  await flush()
+
+  assert.equal(h.editor.textContent, '', '侧栏内部的投放必须完全不拦')
+})
+
+test('从系统拖进来的文件夹（Files）不被接管', async () => {
+  const h = await boot({ hostMax: 100 })
+  const dragStart = h.listeners.get('dragstart')?.[0]
+  const drop = h.listeners.get('drop')?.[0]
+  const row = folderRow('C:\\Users\\Lenovo\\Desktop', 'Desktop')
+
+  dragStart({ dataTransfer: { types: ['Files'], getData: () => '' }, target: row })
+  drop({ dataTransfer: { types: ['Files'], getData: () => '' }, target: chatTarget(), preventDefault: () => {}, stopPropagation: () => {} })
+  await flush()
+
+  assert.equal(h.editor.textContent, '', 'OS 拖进来的文件/文件夹归宿主的上传管线')
 })

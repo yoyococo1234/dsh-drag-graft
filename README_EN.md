@@ -58,10 +58,25 @@ Then reload the page and:
 |---|---|
 | Drag another conversation onto the chat area | A reference chip is inserted; keep editing, then send |
 | Drag several conversations in a row | Multiple chips (limit below) |
+| Drag a **workspace (folder) row** onto the chat area | Inserts that folder's path reference, e.g. `@C:/Users/you/Desktop/` (quoted automatically when the path contains spaces) |
 | Drag the **current** conversation | Blocked with a notice (the host rejects self-references: `cannot reference itself`) |
 | Drop inside the **sidebar** | Never intercepted: official reordering and `dsh-workspace-mover` keep working |
 | Drag a **file** | Never intercepted: host upload behaviour is untouched |
 | Target not found among candidates | Nothing is inserted — never picks a random/wrong conversation |
+
+### Dragging a folder
+
+The sidebar row that groups conversations by directory (a workspace) can be dragged too:
+drop it on the chat area and the draft gains `@C:/Users/you/Desktop/` — that directory,
+handed to the model.
+
+- The inserted form is an **absolute path** (trailing slash, quoted when it contains
+  whitespace), because a relative path means nothing across workspaces.
+- It goes through the host's own `inputActions.insertText`, so it is one undoable edit
+  like typing it yourself — no candidate menu involved.
+- Drops **inside the sidebar** are never intercepted: that is the host's reordering.
+- Folders dragged in from the OS file manager are not touched; the host upload pipeline
+  keeps them.
 
 ### How many references per message?
 
