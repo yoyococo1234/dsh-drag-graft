@@ -58,7 +58,7 @@ Then reload the page and:
 |---|---|
 | Drag another conversation onto the chat area | A reference chip is inserted; keep editing, then send |
 | Drag several conversations in a row | Multiple chips (limit below) |
-| Drag a **workspace (folder) row** onto the chat area | Inserts that folder's path reference, e.g. `@C:/Users/you/Desktop/` (quoted automatically when the path contains spaces) |
+| Drag a **workspace (folder) row** onto the chat area | Inserts a **folder reference chip** (the same node the `@` menu makes for a directory), removed by a single backspace |
 | Drag the **current** conversation | Blocked with a notice (the host rejects self-references: `cannot reference itself`) |
 | Drop inside the **sidebar** | Never intercepted: official reordering and `dsh-workspace-mover` keep working |
 | Drag a **file** | Never intercepted: host upload behaviour is untouched |
@@ -67,13 +67,17 @@ Then reload the page and:
 ### Dragging a folder
 
 The sidebar row that groups conversations by directory (a workspace) can be dragged too:
-drop it on the chat area and the draft gains `@C:/Users/you/Desktop/` — that directory,
-handed to the model.
+drop it on the chat area and the draft gains a **folder reference chip** carrying
+`@C:/Users/you/Desktop/` — that directory, handed to the model. It is a node in the
+editor, exactly like a session reference, so **one backspace removes it**.
 
+- It goes through the host's `conversation.input.for(actx).insertReference(ref, span)` —
+  the same node type the `@` menu produces for a directory (`appearance: 'folder'`), so
+  the look and the backspace behaviour match.
 - The inserted form is an **absolute path** (trailing slash, quoted when it contains
   whitespace), because a relative path means nothing across workspaces.
-- It goes through the host's own `inputActions.insertText`, so it is one undoable edit
-  like typing it yourself — no candidate menu involved.
+- Without the `conversation` service it falls back to `inputActions.insertText` (plain
+  text): the feature still works, it just takes one backspace per character.
 - Drops **inside the sidebar** are never intercepted: that is the host's reordering.
 - Folders dragged in from the OS file manager are not touched; the host upload pipeline
   keeps them.

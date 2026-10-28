@@ -1,4 +1,4 @@
-// @local/drag-graft — Browser half (v2.2.0)
+// @local/drag-graft — Browser half (v2.2.1)
 //
 // 把侧边栏的会话行拖到对话区松手 → 在输入框里插一枚**原生会话引用 chip**，
 // 你可以继续打字，然后自己按发送。
@@ -245,6 +245,7 @@ window.__ModuleLoader__.load({
       let inserting = false // 正在插 chip（防连拖叠加）
       let sending = false // 正在直发兜底
       let inputTriggers = null // 官方 @ 触发服务
+      let conversationRef = null // 官方会话服务：conversation.input.for(actx) 能直接插引用节点
       let inputActionsRef = null // 官方插入位点服务（captureInsertion）
       let occurrencesRef = null // InputState.occurrences：草稿里已有的引用
       let hostLimits = { maxReferences: DEFAULT_MAX_REFERENCES, candidateLimit: null, source: 'default' }
@@ -416,6 +417,17 @@ window.__ModuleLoader__.load({
       } catch (error) {
         console.warn('[drag-graft] inputTriggers 注入失败：', error)
       }
+      // 插「真 chip」要的通道：conversation.input.for(actx).insertReference(ref, span)。
+      // 拿不到就退回 insertText（纯文本），功能还在，只是不能一次退格删掉。
+      try {
+        ctx.inject(['conversation'], (scope) => {
+          conversationRef = scope.conversation
+          console.info('[drag-graft] conversation ready')
+          return () => { conversationRef = null }
+        })
+      } catch (error) {
+        console.warn('[drag-graft] conversation 注入失败，文件夹只能插成纯文本：', error)
+      }
       void refreshLimits()
 
       // ── 输入框定位 ────────────────────────────────────────────────────────
@@ -538,10 +550,18 @@ window.__ModuleLoader__.load({
         }
       }
 
+      /** 文件夹 chip 的 ref：形状与宿主在 @ 菜单里选目录时构造的完全一致。 */
+      const folderRefOf = (path, label) => {
+        const mention = formatFolderMention(path)
+        const name = String(label || path).replace(/[\\/]+$/u, '').split(/[\\/]/u).pop() || String(label || path)
+        return { source: 'reference', ref: mention, label: `${name}/`, appearance: 'folder', clipboardText: mention }
+      }
+
       /**
-       * 把侧栏那个工作区（文件夹）插成草稿里的路径引用。
-       * 走官方的 inputActions.insertText(text, span)：span 用 captureInsertion() 现取，
-       * 与插 chip 同一条 CAS 通道，插进去的是一次可撤销的编辑。
+       * 把侧栏那个工作区（文件夹）插进草稿。
+       * 首选走宿主的 conversation.input.for(actx).insertReference(ref, span)：插进去是
+       * 真的引用节点（和 @ 菜单选目录同一种），**一次退格就能整段删掉**。
+       * 拿不到这条通道时才退回 inputActions.insertText（纯文本，要一个字一个字删）。
        */
       const insertFolderRef = async (path, label) => {
         try {
@@ -550,19 +570,32 @@ window.__ModuleLoader__.load({
             toast('拿不到官方插入位点，文件夹插不进草稿。刷新页面后再试。', true)
             return false
           }
+          const mention = formatFolderMention(path)
+          const ref = folderRefOf(path, label)
+
+          try {
+            const shell = conversationRef?.input?.for?.(sessions.scope?.(currentSessionId))
+            if (shell?.insertReference?.(ref, span)) {
+              console.info('[drag-graft] folder chip inserted:', mention)
+              try { findComposerEditor()?.focus?.() } catch { /* 焦点拿不到不影响插入 */ }
+              return true
+            }
+          } catch (error) {
+            console.warn('[drag-graft] insertReference 不可用，退回纯文本：', error?.message ?? error)
+          }
+
           const editor = findComposerEditor()
           const before = editor?.textContent ?? ''
-          const text = formatFolderMention(path)
           let applied = false
           try {
-            applied = Boolean(inputActionsRef?.insertText?.(text, span))
+            applied = Boolean(inputActionsRef?.insertText?.(mention, span))
           } catch (error) {
             console.warn('[drag-graft] insertText 失败：', error?.message ?? error)
           }
           await new Promise((resolve) => setTimeout(resolve, 120))
           const after = (findComposerEditor() ?? editor)?.textContent ?? ''
           if (applied || after !== before) {
-            console.info('[drag-graft] folder reference inserted:', text)
+            console.info('[drag-graft] folder path inserted as plain text:', mention)
             try { (findComposerEditor() ?? editor)?.focus?.() } catch { /* 焦点拿不到不影响插入 */ }
             return true
           }
@@ -715,7 +748,7 @@ window.__ModuleLoader__.load({
       // 调试钩子（F12 / CDP 用）：只读为主，定位「为什么没插进去」。
       try {
         window.__dragGraft = {
-          version: '2.2.0',
+          version: '2.2.1',
           state: () => ({
             currentSessionId,
             hasInputTriggers: Boolean(inputTriggers),

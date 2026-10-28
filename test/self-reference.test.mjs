@@ -36,6 +36,7 @@ function buildHarness (options = {}) {
   const promptCalls = []
   const spans = []
   const rpcCalls = []
+  const chipInserts = []
   const listeners = new Map()
   let probeComponent = null
   let rev = 0
@@ -98,7 +99,24 @@ function buildHarness (options = {}) {
         },
       }),
     },
-    inject: (names, cb) => cb({ inputTriggers: { sessionOf: () => controller } }),
+    inject: (names, cb) => {
+      const scope = { inputTriggers: { sessionOf: () => controller } }
+      if (Array.isArray(names) && names.includes('conversation') && options.conversation !== false) {
+        scope.conversation = {
+          input: {
+            for: () => ({
+              insertReference: (ref, span) => {
+                chipInserts.push({ ref, span })
+                editor.textContent += `[${ref.label}]`
+                rev += 1
+                return true
+              },
+            }),
+          },
+        }
+      }
+      return cb(scope)
+    },
     connection: {
       rpc: {
         call: async (channel, endpoint, payload) => {
@@ -142,7 +160,7 @@ function buildHarness (options = {}) {
   }
 
   return {
-    ctx, ReactStub, controller, byId, toasts, pickCalls, promptCalls, spans, rpcCalls, listeners, documentStub,
+    ctx, ReactStub, controller, byId, toasts, pickCalls, promptCalls, spans, rpcCalls, chipInserts, listeners, documentStub,
     editor, inputActions, hostMax, getProbe: () => probeComponent,
   }
 }
@@ -418,7 +436,7 @@ const dropOn = (target) => ({
   stopPropagation: () => {},
 })
 
-test('拖左侧工作区（文件夹）行：插成文件夹路径引用', async () => {
+test('拖左侧工作区（文件夹）行：插成真引用节点，一次退格就能删', async () => {
   const h = await boot({ hostMax: 100 })
   const dragStart = h.listeners.get('dragstart')?.[0]
   const drop = h.listeners.get('drop')?.[0]
@@ -426,13 +444,18 @@ test('拖左侧工作区（文件夹）行：插成文件夹路径引用', async
 
   dragStart({ dataTransfer: { types: ['text/plain'], getData: () => 'workspace:Desktop' }, target: row })
   drop(dropOn(chatTarget()))
-  await waitFor(() => h.editor.textContent.length > 0)
+  await waitFor(() => h.chipInserts.length > 0)
 
-  assert.equal(h.editor.textContent, '@C:/Users/Lenovo/Desktop/', '反斜杠要规范成斜杠，目录带尾斜杠')
+  assert.equal(h.chipInserts.length, 1, '应走 insertReference（真 chip），不是 insertText')
+  const ref = h.chipInserts[0].ref
+  assert.equal(ref.appearance, 'folder', '外观必须是 folder')
+  assert.equal(ref.source, 'reference')
+  assert.equal(ref.ref, '@C:/Users/Lenovo/Desktop/', '反斜杠要规范成斜杠，目录带尾斜杠')
+  assert.equal(ref.label, 'Desktop/')
   assert.equal(h.pickCalls.length, 0, '文件夹不走 @ 候选菜单')
 })
 
-test('文件夹路径含空格：加引号', async () => {
+test('文件夹路径含空格：chip 里的 mention 加引号', async () => {
   const h = await boot({ hostMax: 100 })
   const dragStart = h.listeners.get('dragstart')?.[0]
   const drop = h.listeners.get('drop')?.[0]
@@ -440,9 +463,23 @@ test('文件夹路径含空格：加引号', async () => {
 
   dragStart({ dataTransfer: { types: ['text/plain'], getData: () => 'workspace:x' }, target: row })
   drop(dropOn(chatTarget()))
+  await waitFor(() => h.chipInserts.length > 0)
+
+  assert.equal(h.chipInserts[0].ref.ref, '@"D:/我的 项目/"')
+})
+
+test('conversation 服务不可用：退回纯文本，功能不丢', async () => {
+  const h = await boot({ hostMax: 100, conversation: false })
+  const dragStart = h.listeners.get('dragstart')?.[0]
+  const drop = h.listeners.get('drop')?.[0]
+  const row = folderRow('C:\\Users\\Lenovo\\Desktop', 'Desktop')
+
+  dragStart({ dataTransfer: { types: ['text/plain'], getData: () => 'workspace:x' }, target: row })
+  drop(dropOn(chatTarget()))
   await waitFor(() => h.editor.textContent.length > 0)
 
-  assert.equal(h.editor.textContent, '@"D:/我的 项目/"')
+  assert.equal(h.chipInserts.length, 0, '没有通道就不该假装插了 chip')
+  assert.equal(h.editor.textContent, '@C:/Users/Lenovo/Desktop/', '退化成纯文本路径')
 })
 
 test('文件夹行落在侧栏内部：不抢，交给宿主排序', async () => {
