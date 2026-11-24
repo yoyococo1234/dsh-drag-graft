@@ -1,11 +1,14 @@
 /**
  * chip-restore 的纯逻辑层（无 DOM / 无宿主依赖，可单测）。
  *
- * 背景：dsh-rewind 撤回消息后，用 setDraft(纯文本) 把消息回填进输入框。
- * 消息里的会话引用在日志中是这种 token：
- *     @[标题](dsh-session:<base64url(JSON.stringify(sessionId))>)
- * 把它当纯文本塞回输入框时宿主不认，渲染成灰底 `@标题`。
- * 本模块负责把这种 token 找出来、解码出 sessionId，并给出还原成真 chip 所需的数据。
+ * 两种回填形态都要还原成真 chip：
+ *   A) 完整 token： @[标题](dsh-session:<base64url(JSON.stringify(sessionId))>)
+ *      —— drag-graft 刚插入、或宿主未规范化时会出现
+ *   B) 纯 @标题：   @模型选择重复或不可用\n正文
+ *      —— dsh-rewind 撤回后回填的真实形态（会话日志里 token 已被规范化掉）
+ *
+ * B 形态没有 sessionId，只能按标题反查会话列表：精确且唯一命中才还原，
+ * 0 个或多个匹配一律跳过——绝不插错会话（沿用 drag-graft 的纪律）。
  *
  * 编码格式与 @deepseek-ai/dsh-session-reference / dsh-drag-graft 完全一致。
  */
@@ -13,7 +16,9 @@
 /** 匹配一个完整的会话引用 token（标题内允许转义的 \] ）。 */
 export const TOKEN_RE = /@\[((?:[^\]\\]|\\.)*)\]\((dsh-session:[A-Za-z0-9_-]+)\)/g
 
-/** 用纯 JS 实现 base64url 编解码，浏览器/Node 都能用（不依赖 Buffer/btoa）。 */
+/** 匹配一行/一段开头附近的 @标题（不含 [，避免与 A 形态重复匹配）。 */
+const AT_TITLE_RE = /(^|[\s(（])@([^\s@\[(\n\r]+)/g
+
 const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
 
 export function decodeSessionUri(raw) {
@@ -27,7 +32,6 @@ export function decodeSessionUri(raw) {
     if (!/^[A-Za-z0-9_-]+$/.test(payload)) return null
     const base64 = payload.replace(/-/g, '+').replace(/_/g, '/')
     const padded = base64.padEnd(Math.ceil(base64.length / 4) * 4, '=')
-    // 手写 base64 解码，避免 atob 在 Node 单测里要 polyfill
     let binary = ''
     for (let i = 0; i < padded.length; i += 4) {
       const a = B64.indexOf(padded[i])
@@ -47,87 +51,128 @@ export function decodeSessionUri(raw) {
   }
 }
 
-/** 反转义 token 标题里的 \] 和 \\ 。 */
 function unescapeLabel(label) {
   return String(label ?? '').replace(/\\([\]\\])/g, '$1')
 }
 
+/** 从会话列表快照（{byId:{id:{title,displayTitle}}}）建「标题→id」索引。 */
+export function indexByTitle(snapshot) {
+  const byId = snapshot?.byId ?? {}
+  const exact = new Map() // 精确标题 -> Set<id>
+  for (const [id, row] of Object.entries(byId)) {
+    const titles = new Set()
+    for (const value of [row?.displayTitle, row?.title]) {
+      const t = String(value ?? '').trim()
+      if (t) titles.add(t)
+    }
+    for (const t of titles) {
+      if (!exact.has(t)) exact.set(t, new Set())
+      exact.get(t).add(String(id))
+    }
+  }
+  return exact
+}
+
+/** 按标题精确反查：唯一命中返回 id；0 个或多个返回 null。 */
+export function resolveByTitle(index, title) {
+  const ids = index.get(String(title ?? '').trim())
+  if (!ids || ids.size !== 1) return null
+  return [...ids][0]
+}
+
 /**
- * 在一段文本里找出所有合法的会话引用 token。
- * 返回 [{ start, end, raw, title, sessionId }]，按出现顺序。
+ * 找出文本里所有「可还原为 chip」的项。
+ * token 形态优先（有 sessionId）；其余 @标题 用 index 反查。
+ * 返回 [{ start, end, raw, title, sessionId, via }]，按位置排序、互不重叠。
  */
-export function findTokens(text) {
-  const out = []
+export function findReferences(text, titleIndex, selfId) {
+  const original = String(text ?? '')
+  const found = []
+  const occupied = []
+
+  // A) 完整 token
   const re = new RegExp(TOKEN_RE.source, 'g')
   let m
-  while ((m = re.exec(String(text ?? ''))) !== null) {
+  while ((m = re.exec(original)) !== null) {
     const sessionId = decodeSessionUri(m[2])
-    if (!sessionId) continue // 解不出的当普通文本，绝不乱动
-    out.push({
-      start: m.index,
-      end: m.index + m[0].length,
-      raw: m[0],
-      title: unescapeLabel(m[1]),
-      sessionId,
+    if (!sessionId) continue
+    found.push({
+      start: m.index, end: m.index + m[0].length, raw: m[0],
+      title: unescapeLabel(m[1]), sessionId, via: 'token',
     })
+    occupied.push([m.index, m.index + m[0].length])
+  }
+
+  // B) @标题：只处理没被 A 覆盖的、且能唯一反查到会话的
+  const at = new RegExp(AT_TITLE_RE.source, 'g')
+  while ((m = at.exec(original)) !== null) {
+    // 整段 @标题 都要换成 chip：start 指向 @，end 覆盖 @ + 标题
+    const start = m.index + m[1].length
+    const end = start + 1 + m[2].length
+    if (occupied.some(([s, e]) => start < e && end > s)) continue
+    const title = m[2]
+    const sessionId = titleIndex ? resolveByTitle(titleIndex, title) : null
+    if (!sessionId) continue // 反查不到或重名 -> 当普通文本
+    found.push({ start, end, raw: m[2], title, sessionId, via: 'title' })
+    occupied.push([start, end])
+  }
+
+  found.sort((a, b) => a.start - b.start)
+  return found
+}
+
+/** 构造 insertReference 需要的 ref 对象。 */
+export function referenceOf(ref) {
+  if (ref.via === 'token') {
+    const uri = ref.raw.slice(ref.raw.indexOf('(dsh-session:') + 1, -1)
+    return { source: 'reference', ref: uri, label: ref.title || ref.sessionId, appearance: 'session', clipboardText: ref.raw }
+  }
+  // 标题反查：mention 用现成的编码函数（与宿主一致）
+  const json = JSON.stringify(String(ref.sessionId))
+  let binary = ''
+  const bytes = new TextEncoder().encode(json)
+  for (const b of bytes) binary += String.fromCharCode(b)
+  const payload = btoaCompat(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '')
+  const mention = `dsh-session:${payload}`
+  return { source: 'reference', ref: mention, label: ref.title, appearance: 'session', clipboardText: `@${ref.title}` }
+}
+
+function btoaCompat(binary) {
+  if (typeof btoa === 'function') return btoa(binary)
+  const B = B64
+  let out = ''
+  for (let i = 0; i < binary.length; i += 3) {
+    const a = binary.charCodeAt(i)
+    const b = i + 1 < binary.length ? binary.charCodeAt(i + 1) : -1
+    const c = i + 2 < binary.length ? binary.charCodeAt(i + 2) : -1
+    out += B[a >> 2] + B[((a & 3) << 4) | (b < 0 ? 0 : b >> 4)] + (b < 0 ? '=' : B[((b & 15) << 2) | (c < 0 ? 0 : c >> 6)]) + (c < 0 ? '=' : B[c & 63])
   }
   return out
 }
 
 /**
- * 构造 insertReference 需要的 ref 对象（形状与 drag-graft 的 folderRefOf 一致，
- * 只是 appearance 换成 session）。mention 复用原 token 里的 URI，保证与宿主编码一致。
+ * 规划一次还原：给出「去掉引用文本后的纯文本」和插 chip 的位置。
  */
-export function referenceOf(token) {
-  const uri = token.raw.slice(token.raw.indexOf('(dsh-session:') + 1, -1)
-  return {
-    source: 'reference',
-    ref: uri,
-    label: token.title || token.sessionId,
-    appearance: 'session',
-    clipboardText: token.raw,
-  }
-}
-
-/**
- * 规划一次还原：给出「去掉 token 后的纯文本」和「要在哪些偏移插 chip」。
- * 这里只算文本、不碰 DOM，方便测试。insertion 的 offset 指去 token 后字符串里的位置。
- */
-export function planRestore(text, selfId) {
+export function planRestore(text, { byId, selfId, titleIndex } = {}) {
   const original = String(text ?? '')
-  const tokens = findTokens(original)
-  if (!tokens.length) return { changed: false, text: original, insertions: [], tokens }
+  const index = titleIndex ?? (byId ? indexByTitle({ byId }) : null)
+  const refs = findReferences(original, index, selfId)
+  const usable = refs.filter((r) => !(selfId && r.sessionId === selfId)) // 自引用不还原
+  if (!usable.length) return { changed: false, text: original, insertions: [], refs }
 
   let cursor = 0
   let cleaned = ''
   const insertions = []
-  for (const token of tokens) {
-    cleaned += original.slice(cursor, token.start)
-    const offset = cleaned.length
-    cursor = token.end
-    if (selfId && token.sessionId === selfId) {
-      // 自引用：宿主会整轮拒绝。保留原 token 文本，不插 chip（交给用户自己删）
-      cleaned += token.raw
-      continue
-    }
-    insertions.push({ offset, token, ref: referenceOf(token) })
+  for (const ref of usable) {
+    cleaned += original.slice(cursor, ref.start)
+    insertions.push({ offset: cleaned.length, ref })
+    cursor = ref.end
   }
   cleaned += original.slice(cursor)
-
-  const changed = insertions.length > 0
-  return {
-    changed,
-    text: changed ? cleaned : original,
-    insertions, // 每个含 offset + token + ref，调用方按 offset 从大到小插，避免偏移漂移
-    tokens,
-  }
+  return { changed: true, text: cleaned, insertions, refs }
 }
 
-/**
- * 把 planRestore 的 insertions 应用到编辑器结构里。
- * 纯函数版：接受「按 offset 切好的段」，返回新的字符串序列，供测试验证顺序正确。
- * 真实 DOM 版在 client.js 里用 insertReference 实现。
- */
+/** 纯函数版分段，供测试验证顺序。 */
 export function applyPlanToSegments(plan, chipMarker = '[chip]') {
   if (!plan.changed) return [plan.text]
   const pieces = []

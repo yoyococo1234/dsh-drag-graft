@@ -16,7 +16,10 @@ window.__ModuleLoader__.load({
     const h = React.createElement
 
     // 纯逻辑：与 lib/token.mjs 同源，内联于此（client 是独立 bundle，不能 import 包内文件）。
+    // 两种回填形态都处理：A) @[标题](dsh-session:...) token；B) @标题（rewind 回填的真实形态，按标题反查 id）。
     const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+    const TOKEN_RE = '@\\[((?:[^\\]\\\\]|\\\\.)*)\\]\\((dsh-session:[A-Za-z0-9_-]+)\\)'
+    const AT_TITLE_RE = '(^|[\\s(（])@([^\\s@\\[(\\n\\r]+)'
     function decodeSessionUri(raw) {
       try {
         const text = String(raw ?? '')
@@ -43,50 +46,91 @@ window.__ModuleLoader__.load({
         return typeof parsed === 'string' && parsed ? parsed : null
       } catch { return null }
     }
-    const TOKEN_RE = '@\\[((?:[^\\]\\\\]|\\\\.)*)\\]\\((dsh-session:[A-Za-z0-9_-]+)\\)'
-    function findTokens(text) {
-      const out = []
-      const re = new RegExp(TOKEN_RE, 'g')
-      let m
-      while ((m = re.exec(String(text ?? ''))) !== null) {
-        const sessionId = decodeSessionUri(m[2])
-        if (!sessionId) continue
-        out.push({
-          start: m.index,
-          end: m.index + m[0].length,
-          raw: m[0],
-          title: String(m[1] ?? '').replace(/\\([\\\]])/g, '$1'),
-          sessionId,
-        })
+    function btoaCompat(binary) {
+      if (typeof btoa === 'function') return btoa(binary)
+      let out = ''
+      for (let i = 0; i < binary.length; i += 3) {
+        const a = binary.charCodeAt(i)
+        const b = i + 1 < binary.length ? binary.charCodeAt(i + 1) : -1
+        const c = i + 2 < binary.length ? binary.charCodeAt(i + 2) : -1
+        out += B64[a >> 2] + B64[((a & 3) << 4) | (b < 0 ? 0 : b >> 4)] + (b < 0 ? '=' : B64[((b & 15) << 2) | (c < 0 ? 0 : c >> 6)]) + (c < 0 ? '=' : B64[c & 63])
       }
       return out
     }
-    function referenceOf(token) {
-      const uri = token.raw.slice(token.raw.indexOf('(dsh-session:') + 1, -1)
-      return {
-        source: 'reference',
-        ref: uri,
-        label: token.title || token.sessionId,
-        appearance: 'session',
-        clipboardText: token.raw,
+    function indexByTitle(snapshot) {
+      const byId = snapshot?.byId ?? {}
+      const exact = new Map()
+      for (const [id, row] of Object.entries(byId)) {
+        const titles = new Set()
+        for (const value of [row?.displayTitle, row?.title]) {
+          const t = String(value ?? '').trim()
+          if (t) titles.add(t)
+        }
+        for (const t of titles) {
+          if (!exact.has(t)) exact.set(t, new Set())
+          exact.get(t).add(String(id))
+        }
       }
+      return exact
     }
-    function planRestore(text, selfId) {
-      const original = String(text ?? '')
-      const tokens = findTokens(original)
-      if (!tokens.length) return { changed: false, text: original, insertions: [] }
+    function resolveByTitle(index, title) {
+      const ids = index.get(String(title ?? '').trim())
+      if (!ids || ids.size !== 1) return null
+      return [...ids][0]
+    }
+    function findReferences(original0, titleIndex, selfId) {
+      const original = String(original0 ?? '')
+      const found = []
+      const occupied = []
+      const re = new RegExp(TOKEN_RE, 'g')
+      let m
+      while ((m = re.exec(original)) !== null) {
+        const sessionId = decodeSessionUri(m[2])
+        if (!sessionId) continue
+        found.push({ start: m.index, end: m.index + m[0].length, raw: m[0], title: String(m[1] ?? '').replace(/\\([\\\]])/g, '$1'), sessionId, via: 'token' })
+        occupied.push([m.index, m.index + m[0].length])
+      }
+      const at = new RegExp(AT_TITLE_RE, 'g')
+      while ((m = at.exec(original)) !== null) {
+        const start = m.index + m[1].length // start 指向 @，整段 @标题 换成 chip
+        const end = start + 1 + m[2].length
+        if (occupied.some(([s, e]) => start < e + 1 && end > s - 1)) continue
+        const title = m[2]
+        const sessionId = titleIndex ? resolveByTitle(titleIndex, title) : null
+        if (!sessionId) continue
+        found.push({ start, end, raw: title, title, sessionId, via: 'title' })
+        occupied.push([start, end])
+      }
+      found.sort((a, b) => a.start - b.start)
+      return found
+    }
+    function referenceOf(ref) {
+      if (ref.via === 'token') {
+        const uri = ref.raw.slice(ref.raw.indexOf('(dsh-session:') + 1, -1)
+        return { source: 'reference', ref: uri, label: ref.title || ref.sessionId, appearance: 'session', clipboardText: ref.raw }
+      }
+      const json = JSON.stringify(String(ref.sessionId))
+      let binary = ''
+      for (const b of new TextEncoder().encode(json)) binary += String.fromCharCode(b)
+      const payload = btoaCompat(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '')
+      return { source: 'reference', ref: `dsh-session:${payload}`, label: ref.title, appearance: 'session', clipboardText: `@${ref.title}` }
+    }
+    function planRestore(original, { byId, selfId, titleIndex }) {
+      const text = String(original ?? '')
+      const index = titleIndex ?? (byId ? indexByTitle({ byId }) : null)
+      const refs = findReferences(text, index, selfId)
+      const usable = refs.filter((r) => !(selfId && r.sessionId === selfId))
+      if (!usable.length) return { changed: false, text, insertions: [], refs }
       let cursor = 0
       let cleaned = ''
       const insertions = []
-      for (const token of tokens) {
-        cleaned += original.slice(cursor, token.start)
-        const offset = cleaned.length
-        cursor = token.end
-        if (selfId && token.sessionId === selfId) { cleaned += token.raw; continue }
-        insertions.push({ offset, ref: referenceOf(token) })
+      for (const ref of usable) {
+        cleaned += text.slice(cursor, ref.start)
+        insertions.push({ offset: cleaned.length, ref })
+        cursor = ref.end
       }
-      cleaned += original.slice(cursor)
-      return { changed: insertions.length > 0, text: insertions.length ? cleaned : original, insertions }
+      cleaned += text.slice(cursor)
+      return { changed: true, text: cleaned, insertions, refs }
     }
 
     const inject = ['slots', 'sessions']
@@ -125,14 +169,20 @@ window.__ModuleLoader__.load({
         try { return ctx.sessions?.scope?.(currentSessionId) } catch { return null }
       }
 
+      const sessionSnapshot = () => {
+        try { return ctx.sessions?.list?.getSnapshot?.() ?? null } catch { return null }
+      }
+
       const tryRestore = async () => {
         if (busy) return
         const editor = findEditor()
         if (!editor) return
         const text = editor.textContent || ''
-        if (!text.includes('dsh-session:')) return
+        if (!text.includes('@') && !text.includes('dsh-session:')) return
         if (text === lastHandled) return
-        const plan = planRestore(text, currentSessionId)
+        // 标题反查需要会话列表快照；拿不到就无法处理 B 形态
+        const snap = sessionSnapshot()
+        const plan = planRestore(text, { byId: snap?.byId, selfId: currentSessionId })
         if (!plan.changed) return
 
         const sc = scope()
@@ -209,7 +259,8 @@ window.__ModuleLoader__.load({
           const editor = findEditor()
           if (!editor) return
           const text = editor.textContent || ''
-          if (text.includes('dsh-session:')) schedule()
+          // B 形态是 @标题（无 dsh-session:），所以只看 @；@ 很常见，靠 planRestore 精确判定
+          if (text.includes('@')) schedule()
         })
         observer.observe(document.body, { childList: true, characterData: true, subtree: true })
       } catch (error) {
@@ -225,7 +276,7 @@ window.__ModuleLoader__.load({
       // 调试钩子
       try {
         window.__chipRestore = {
-          version: '1.0.0',
+          version: '1.0.1',
           state: () => ({ session: currentSessionId, hasConversation: Boolean(conversationRef), lastHandled }),
           restoreNow: () => tryRestore(),
         }

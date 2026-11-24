@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "会话引用 Chip 还原",
-    "description": "撤回对话后，把输入框里灰底的 @[会话](dsh-session:...) 纯文本引用自动还原成蓝色 chip，无需重新拖拽。配合 dsh-rewind 使用；不改变原版 dsh-drag-graft 的行为。必须在 DSH 重启后生效。"
+    "description": "撤回对话后，把输入框里灰底的 @会话标题 纯文本引用自动还原成蓝色 chip：按会话列表标题精确反查（重名则跳过），也支持完整的 @[标题](dsh-session:...) token。配合 dsh-rewind 使用；不改变原版 dsh-drag-graft。安装后需重启 DSH。"
   }
 }
