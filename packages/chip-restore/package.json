@@ -1,7 +1,8 @@
 {
   "name": "dsh-drag-graft-chip-restore",
   "version": "1.0.1",
-  "description": "After a dsh-rewind, restore the grey @Title text in the composer back into a native session-reference chip by matching the title against the session list. Also handles full @[title](dsh-session:...) tokens. Companion to dsh-drag-graft; does not modify rewind.",
+  "deprecated": "DO NOT USE: 1.0.0/1.0.1 can drop the session reference from a rewind refill instead of restoring it. This package is abandoned; see README. The original dsh-drag-graft is unaffected.",
+  "description": "DEPRECATED — see deprecated field. After a dsh-rewind, restore the grey @Title text in the composer back into a native session-reference chip by matching the title against the session list. Also handles full @[title](dsh-session:...) tokens. Companion to dsh-drag-graft; does not modify rewind.",
   "type": "module",
   "license": "MIT",
   "author": "yoyococo1234 <yoyococo1234@users.noreply.github.com>",
