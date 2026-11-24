@@ -1,0 +1,62 @@
+{
+  "name": "dsh-drag-graft-chip-restore",
+  "version": "1.0.0",
+  "description": "After a dsh-rewind, restore plain-text @[session](dsh-session:...) tokens in the composer back into native session-reference chips. Companion to dsh-drag-graft; does not modify rewind.",
+  "type": "module",
+  "license": "MIT",
+  "author": "yoyococo1234 <yoyococo1234@users.noreply.github.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yoyococo1234/dsh-drag-graft.git",
+    "directory": "packages/chip-restore"
+  },
+  "homepage": "https://github.com/yoyococo1234/dsh-drag-graft/tree/main/packages/chip-restore#readme",
+  "bugs": {
+    "url": "https://github.com/yoyococo1234/dsh-drag-graft/issues"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "mcp",
+    "session-reference",
+    "rewind",
+    "chip-restore"
+  ],
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "lib/*.mjs"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "check": "node --check index.js && node --check client.js && node --check lib/token.mjs && npm test"
+  },
+  "engines": {
+    "dsh": ">=0.2.1-rc.2 <0.3.0-0",
+    "node": ">=22"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-slots"
+      ]
+    }
+  }
+}

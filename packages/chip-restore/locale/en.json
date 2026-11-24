@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Session reference chip restore",
+    "description": "After a rewind, turn the grey @[session](dsh-session:...) plain-text reference in the composer back into a blue chip, without dragging again. Works with dsh-rewind; leaves the original dsh-drag-graft untouched. Requires a DSH restart."
+  }
+}

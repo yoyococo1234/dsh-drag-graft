@@ -1,0 +1,4 @@
+# chip-restore: one host row + one client bundle.
+- insert:
+    - id: chip-restore
+      name: 'dsh-drag-graft-chip-restore'
